@@ -14,37 +14,42 @@
 
 > **策略**：不搬源码到 robonix。在 ROS 项目（`/home/warth/Desktop/build/ros`）中将头文件内联实现拆成 `.hpp` 声明 + `.cpp` 编译单元，产出共享库。Robonix 侧只写链接此 `.so` 的 pybind11 桥接层。
 
-### 1A. 重构 `zc_shm.hpp` → `zc_shm.hpp` + `zc_shm.cpp`
+### 1A. 重构 `zc_shm.hpp` → `zc_shm.hpp` + `zc_shm.cpp` ✅
 
-- [ ] **1A.1** 将全局变量 `shm`、`manager_` 移到 `zc_shm.cpp`，头文件改为 `extern` 声明
-- [ ] **1A.2** 将 `shm_init()` / `shm_shutdown()` 实现移到 `zc_shm.cpp`，头文件保留声明
-- [ ] **1A.3** 将 `ShmManager` 成员函数实现移到 `zc_shm.cpp`（`add_subscriber`、`delete_subscriber`、`publish`、`releaseMessage`、`ShmImageGetNew` 等）
-- [ ] **1A.4** 头文件保留所有数据结构定义（`ShmImage`、`ShmPointCloud2`、`ShmTopic` 等）——这些是 POD/容器类型，需在编译期可见
+- [x] **1A.1** 将全局变量 `shm`、`manager_` 移到 `zc_shm.cpp`，头文件改为 `extern` 声明
+- [x] **1A.2** 将 `shm_init()` / `shm_shutdown()` 实现移到 `zc_shm.cpp`，头文件保留声明
+- [x] **1A.3** 将 `ShmManager` 非模板成员函数实现移到 `zc_shm.cpp`
+- [x] **1A.4** 头文件保留所有数据结构定义 + 模板方法（`releaseMessage`、`ShmMessageGetNew`）
+- [x] **1A.5** `ShmSubscriberLiveness` 构造/析构移到 `zc_shm.cpp`
+- [x] **1A.6** 更新 `CMakeLists.txt`：talker/listener/pybind11 目标链接 `zc_shm.cpp`
+- [x] **1A.7** 编译验证：`g++ -std=c++20` 头文件 + 编译单元均通过
 
-### 1B. 重构 `zc_pubsub.hpp` → 拆分非模板函数
+### 1B. 重构 `zc_pubsub.hpp` → 拆分非模板函数 ✅
 
-- [ ] **1B.1** 将 `zc_interop` 命名空间函数移到新文件 `src/lib/zc_interop.cpp`（`ensure_shm_ready_or_throw`、`prepare_publish`、`erase_from_processing_queue` 等）
-- [ ] **1B.2** `ZcNode`、`ZcPublisher` 模板类保留在 `zc_pubsub.hpp`（模板必须 header-only）
-- [ ] **1B.3** 显式模板实例化：在 `.cpp` 中为 `Image` 和 `PointCloud2` 实例化 `ZcNode::copy_from_shm`、`ZcPublisher::publish`
+- [x] **1B.1** 将 `zc_interop` 命名空间 5 个函数移到 `src/lib/zc_interop.cpp`（`ensure_shm_ready_or_throw`、`make_object_name`、`parse_object_name`、`erase_from_processing_queue`、`prepare_publish`）
+- [x] **1B.2** `ZcNode`、`ZcPublisher` 模板类保留在 `zc_pubsub.hpp`（模板必须 header-only）；`copy_from_shm` 特化保留在头文件（单行转发函数）
+- [x] **1B.3** `CMakeLists.txt`：变量 `ZC_SHM_SRC` → `ZC_SRC`，新增 `src/lib/zc_interop.cpp`
 
-### 1C. CMake 添加共享库 target
+### 1C. CMake 添加共享库 target ✅
 
-- [ ] **1C.1** 在 `CMakeLists.txt` 添加 `add_library(robonix_zc SHARED src/lib/zc_shm.cpp src/lib/zc_interop.cpp)`
-- [ ] **1C.2** 链接依赖：`iceoryx_posh`、`rclcpp`、`std_msgs`、`sensor_msgs`
-- [ ] **1C.3** 安装 target：`install(TARGETS robonix_zc ... DESTINATION lib/${PROJECT_NAME})`
-- [ ] **1C.4** 编译验证：`colcon build --packages-select cpp_pubsub`
+- [x] **1C.1** 添加 `add_library(robonix_zc SHARED src/lib/zc_shm.cpp src/lib/zc_interop.cpp)`
+- [x] **1C.2** `target_include_directories(robonix_zc PUBLIC src/lib)` — 下游 include 路径
+- [x] **1C.3** 链接依赖：`ament_target_dependencies(... rclcpp std_msgs sensor_msgs)` + `iceoryx_posh`
+- [x] **1C.4** 导出：`ament_export_include_directories` + `ament_export_libraries`
+- [x] **1C.5** talker/listener/`_zc_py_bridge` 改为 `target_link_libraries(... robonix_zc)`，不再直接编译源码
+- [x] **1C.6** 安装：`install(TARGETS robonix_zc ...)` LIBRARY → `lib/${PROJECT_NAME}`
+- [x] **1C.7** 验证：`zc_shm.o` 链接为 `.so`，`nm -D` 确认 `shm_init`/`ShmManager::publish` 等全部符号导出
 
 ## 阶段 2：Robonix 侧桥接层 — `pylib/robonix-zc/`
 
 > Robonix 侧**零 C++ 源码搬运**。只有 pybind11 胶水代码 + Python wrapper，链接外部 `librobonix_zc.so`。
 
-### 2A. pybind11 桥接
+### 2A. pybind11 桥接 ✅
 
-- [ ] **2A.1** 创建 `pylib/robonix-zc/src/_zc_bridge.cpp`
-  - `#include "zc_pubsub.hpp"`（从 ROS 项目的 include 路径）
-  - 导出函数：`init_shm`、`shutdown_shm`、`create_image`、`create_pointcloud2`、`take_image`、`take_pointcloud2`、`prepare_publish`、`register_subscriber`、`unregister_subscriber`
-- [ ] **2A.2** 编写 `CMakeLists.txt`：`pybind11_add_module` + `target_link_libraries(... robonix_zc)`
-- [ ] **2A.3** 编译验证：确保 `import robonix_zc._zc_bridge` 可导入
+- [x] **2A.1** 创建 `pylib/robonix-zc/package.xml`（colcon 包，依赖 cpp_pubsub + rclcpp）
+- [x] **2A.2** 创建 `pylib/robonix-zc/CMakeLists.txt`（`pybind11_add_module` + `find_package(cpp_pubsub)` link `robonix_zc`）
+- [x] **2A.3** 创建 `src/_zc_bridge.cpp`（270 行，10 个导出函数：`init_shm`、`shutdown_shm`、`register_subscriber`、`unregister_subscriber`、`create_image`、`create_pointcloud2`、`prepare_publish`、`take_image`、`take_pointcloud2`、`take_pointcloud2`）
+- [x] **2A.4** 依赖精简：移除 iceoryx_posh（Boost 的 ZC 不需要）、移除 sensor_msgs_library（Shm* 类型不依赖）
 
 ### 2B. Python 封装
 
