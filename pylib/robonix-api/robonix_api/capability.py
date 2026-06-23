@@ -41,6 +41,7 @@ from .atlas_types import (
     LifecycleState,
     McpParams,
     Ros2Params,
+    Ros2ZcParams,
     Transport,
 )
 from .codegen import ensure_proto_gen, find_pkg_root
@@ -85,8 +86,8 @@ def _install_simple_logger() -> None:
 # check at declare_capability time).
 _MODE_TRANSPORT_OK = {
     "rpc": {"grpc", "mcp", "ros2"},
-    "topic_in": {"ros2", "grpc"},
-    "topic_out": {"ros2", "grpc"},
+    "topic_in": {"ros2", "grpc", "ros2_zc"},
+    "topic_out": {"ros2", "grpc", "ros2_zc"},
 }
 
 
@@ -246,7 +247,7 @@ class _ProviderBase:
         contract_id: str,
         endpoint: str,
         transport: Transport | str | int,
-        params: GrpcParams | Ros2Params | McpParams | None = None,
+        params: GrpcParams | Ros2Params | McpParams | Ros2ZcParams | None = None,
         description: str = "",
     ) -> str:
         """Declare a Capability for `contract_id` on this CapabilityProvider.

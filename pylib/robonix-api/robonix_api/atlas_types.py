@@ -16,6 +16,7 @@ class Transport(IntEnum):
     GRPC = 1
     ROS2 = 2
     MCP = 3
+    ROS2_ZC = 4
 
 
 class Kind(IntEnum):
@@ -55,6 +56,13 @@ class McpParams:
 
 
 @dataclass(frozen=True, slots=True)
+class Ros2ZcParams:
+    shm_name: str = "robonix_zc"
+    shm_size: int = 67108864  # 64 MiB
+    qos_profile: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class FieldSpec:
     name: str
     type_name: str
@@ -75,7 +83,7 @@ class Capability:
     contract_id: str
     transport: Transport
     description: str = ""
-    params: GrpcParams | Ros2Params | McpParams | None = None
+    params: GrpcParams | Ros2Params | McpParams | Ros2ZcParams | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +127,7 @@ class Channel:
     transport: Transport
     endpoint: str
     channel_id: str
-    params: GrpcParams | Ros2Params | McpParams | None = None
+    params: GrpcParams | Ros2Params | McpParams | Ros2ZcParams | None = None
     _closer: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
 
@@ -154,7 +162,7 @@ def from_pb_field_spec(pb_f) -> FieldSpec:
     )
 
 
-def from_pb_params(transport: Transport, pb_params) -> GrpcParams | Ros2Params | McpParams | None:
+def from_pb_params(transport: Transport, pb_params) -> GrpcParams | Ros2Params | McpParams | Ros2ZcParams | None:
     if pb_params is None:
         return None
     if transport == Transport.GRPC and pb_params.HasField("grpc"):
@@ -168,6 +176,13 @@ def from_pb_params(transport: Transport, pb_params) -> GrpcParams | Ros2Params |
         return Ros2Params(qos_profile=pb_params.ros2.qos_profile)
     if transport == Transport.MCP and pb_params.HasField("mcp"):
         return McpParams(input_schema_json=pb_params.mcp.input_schema_json or "{}")
+    if transport == Transport.ROS2_ZC and pb_params.HasField("ros2_zc"):
+        zc = pb_params.ros2_zc
+        return Ros2ZcParams(
+            shm_name=zc.shm_name or "robonix_zc",
+            shm_size=int(zc.shm_size) if zc.shm_size else 67108864,
+            qos_profile=zc.qos_profile,
+        )
     return None
 
 

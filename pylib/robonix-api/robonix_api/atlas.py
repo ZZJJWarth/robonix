@@ -37,6 +37,7 @@ from .atlas_types import (
     LifecycleState,
     McpParams,
     Ros2Params,
+    Ros2ZcParams,
     Transport,
     from_pb_capability,
     from_pb_contract,
@@ -58,6 +59,8 @@ def _resolve_transport(t: Transport | str | int) -> Transport:
         "ros":  Transport.ROS2,
         "grpc": Transport.GRPC,
         "mcp":  Transport.MCP,
+        "ros2_zc": Transport.ROS2_ZC,
+        "ros2zc": Transport.ROS2_ZC,
         "":     Transport.UNSPECIFIED,
         "unspecified": Transport.UNSPECIFIED,
     }.get(name, Transport.UNSPECIFIED)
@@ -138,6 +141,7 @@ class _Atlas:
             Transport.GRPC:        pb.TRANSPORT_GRPC,
             Transport.ROS2:        pb.TRANSPORT_ROS2,
             Transport.MCP:         pb.TRANSPORT_MCP,
+            Transport.ROS2_ZC:     pb.TRANSPORT_ROS2_ZC,
             Transport.UNSPECIFIED: pb.TRANSPORT_UNSPECIFIED,
         }[_resolve_transport(t)]
 
@@ -223,7 +227,7 @@ class _Atlas:
         contract_id: str,
         transport: Transport | str | int,
         endpoint: str,
-        params: GrpcParams | Ros2Params | McpParams | None = None,
+        params: GrpcParams | Ros2Params | McpParams | Ros2ZcParams | None = None,
         description: str = "",
     ) -> str:
         """Declare one Capability on a registered CapabilityProvider. Returns
@@ -251,7 +255,7 @@ class _Atlas:
     def _params_to_pb(
         self,
         transport: Transport | str | int,
-        params: GrpcParams | Ros2Params | McpParams | None,
+        params: GrpcParams | Ros2Params | McpParams | Ros2ZcParams | None,
     ):
         pb = self._wire_pb
         t = _resolve_transport(transport)
@@ -263,6 +267,9 @@ class _Atlas:
                     proto_file="robonix_contracts.proto"))
             if t == Transport.MCP:
                 return pb.TransportParams(mcp=pb.McpParams(input_schema_json="{}"))
+            if t == Transport.ROS2_ZC:
+                return pb.TransportParams(ros2_zc=pb.Ros2ZcParams(
+                    shm_name="robonix_zc", shm_size=67108864))
             return pb.TransportParams()
         if isinstance(params, GrpcParams):
             return pb.TransportParams(grpc=pb.GrpcParams(
@@ -275,6 +282,12 @@ class _Atlas:
         if isinstance(params, McpParams):
             return pb.TransportParams(mcp=pb.McpParams(
                 input_schema_json=params.input_schema_json or "{}"))
+        if isinstance(params, Ros2ZcParams):
+            return pb.TransportParams(ros2_zc=pb.Ros2ZcParams(
+                shm_name=params.shm_name or "robonix_zc",
+                shm_size=params.shm_size or 67108864,
+                qos_profile=params.qos_profile,
+            ))
         raise TypeError(f"unknown params type: {type(params).__name__}")
 
     # -- discovery (CapabilityProvider-shaped) -----------------------------

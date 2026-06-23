@@ -41,6 +41,11 @@ enum TransportParamsState {
     Mcp {
         input_schema_json: String,
     },
+    Ros2Zc {
+        shm_name: String,
+        shm_size: u64,
+        qos_profile: String,
+    },
 }
 
 impl TransportParamsState {
@@ -49,6 +54,7 @@ impl TransportParamsState {
             Self::Grpc { .. } => Transport::Grpc,
             Self::Ros2 { .. } => Transport::Ros2,
             Self::Mcp { .. } => Transport::Mcp,
+            Self::Ros2Zc { .. } => Transport::Ros2Zc,
         }
     }
 }
@@ -71,6 +77,15 @@ impl From<&TransportParamsState> for pb::TransportParams {
             }),
             TransportParamsState::Mcp { input_schema_json } => Kind::Mcp(pb::McpParams {
                 input_schema_json: input_schema_json.clone(),
+            }),
+            TransportParamsState::Ros2Zc {
+                shm_name,
+                shm_size,
+                qos_profile,
+            } => Kind::Ros2Zc(pb::Ros2ZcParams {
+                shm_name: shm_name.clone(),
+                shm_size: *shm_size,
+                qos_profile: qos_profile.clone(),
             }),
         };
         Self { kind: Some(kind) }
@@ -685,11 +700,11 @@ impl AtlasRegistry {
 }
 
 /// Whether Atlas can mint a fresh endpoint name for this transport without
-/// requiring a prior OS-level bind by the caller. ros2 is a pure-name
-/// address space; grpc and mcp need a host:port that only the caller can
-/// produce.
+/// requiring a prior OS-level bind by the caller. ros2 and ros2_zc are pure-
+/// name address spaces (topic names); grpc and mcp need a host:port that only
+/// the caller can produce.
 fn atlas_can_mint(transport: Transport) -> bool {
-    matches!(transport, Transport::Ros2)
+    matches!(transport, Transport::Ros2 | Transport::Ros2Zc)
 }
 
 /// Convert wire `pb::TransportParams` into the typed Rust enum and verify
@@ -729,6 +744,15 @@ fn parse_params(
                 input_schema_json: m.input_schema_json,
             }
         }
+        Kind::Ros2Zc(zc) => TransportParamsState::Ros2Zc {
+            shm_name: if zc.shm_name.is_empty() {
+                "robonix_zc".to_string()
+            } else {
+                zc.shm_name
+            },
+            shm_size: if zc.shm_size == 0 { 67_108_864 } else { zc.shm_size },
+            qos_profile: zc.qos_profile,
+        },
     };
     if params_state.transport() != transport {
         return Err(Status::invalid_argument(format!(

@@ -85,6 +85,9 @@ enum Transport {
   TRANSPORT_GRPC = 1;
   TRANSPORT_ROS2 = 2;
   TRANSPORT_MCP = 3;
+  // Zero-copy ROS 2: data sits in Boost.Interprocess shared memory;
+  // only an object name ("ShmObject_N") is published over the ROS topic.
+  TRANSPORT_ROS2_ZC = 4;
 }
 
 // Closed set of CapabilityProvider kinds -- exactly three. Used in:
@@ -179,11 +182,23 @@ message McpParams {
   string input_schema_json = 1;
 }
 
+message Ros2ZcParams {
+  // Shared-memory segment name. Providers sharing the same segment
+  // MUST use the same name. Default: "robonix_zc".
+  string shm_name = 1;
+  // Shared-memory segment size in bytes. Default: 67108864 (64 MiB).
+  uint64 shm_size = 2;
+  // Optional QoS override for the underlying ROS 2 String topic that
+  // carries object names; "" => ROS 2 default profile.
+  string qos_profile = 3;
+}
+
 message TransportParams {
   oneof kind {
     GrpcParams grpc = 1;
     Ros2Params ros2 = 2;
     McpParams mcp = 3;
+    Ros2ZcParams ros2_zc = 4;
   }
 }
 
@@ -219,9 +234,10 @@ message DeclareCapabilityRequest {
   string contract_id = 2;
   Transport transport = 3;
   // Preferred address string. Format is transport-specific:
-  //   grpc:  "127.0.0.1:50105"   (caller binds first)
-  //   ros2:  "/scanner/cloud"     ("" => Atlas mints)
-  //   mcp:   "http://host:port/mcp"
+  //   grpc:     "127.0.0.1:50105"   (caller binds first)
+  //   ros2:     "/scanner/cloud"     ("" => Atlas mints)
+  //   mcp:      "http://host:port/mcp"
+  //   ros2_zc:  "/camera/image_zc"   (ROS topic that carries object names)
   //
   // Conflict resolution:
   //   - empty proposal + mintable transport (ros2)
@@ -285,7 +301,8 @@ message DeclareCapabilityResponse {
 // across by hand.
 //
 // Invariant: `params`'s oneof variant matches `transport` --
-//   GRPC <-> GrpcParams, ROS2 <-> Ros2Params, MCP <-> McpParams.
+//   GRPC <-> GrpcParams, ROS2 <-> Ros2Params, MCP <-> McpParams,
+//   ROS2_ZC <-> Ros2ZcParams.
 // Atlas enforces this at DeclareCapability time, so a Capability read
 // from Query is guaranteed consistent. Consumers MAY assume this and
 // skip a re-check.
