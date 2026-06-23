@@ -1,0 +1,12 @@
+# Zero-copy RGB camera stream.
+# Same IDL and mode as rgb.v1 — the "_zc" suffix identifies the
+# zero-copy transport variant.  Existing rgb contract is untouched.
+[contract]
+id      = "robonix/primitive/camera/rgb_zc"
+version = "1"
+kind    = "primitive"
+idl     = "common_interfaces/sensor_msgs/msg/Image.msg"
+description = "RGB camera stream over zero-copy shared-memory transport."
+
+[mode]
+type = "topic_out"

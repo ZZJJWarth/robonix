@@ -1,0 +1,18 @@
+[project]
+name = "robonix-zc"
+version = "0.1.0"
+description = "Python zero-copy transport for ROS 2 heavy-payload messages (Image, PointCloud2)"
+license = "MulanPSL-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "rclpy",
+    "sensor_msgs",
+    "std_msgs",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]

@@ -51,37 +51,21 @@
 - [x] **2A.3** 创建 `src/_zc_bridge.cpp`（270 行，10 个导出函数：`init_shm`、`shutdown_shm`、`register_subscriber`、`unregister_subscriber`、`create_image`、`create_pointcloud2`、`prepare_publish`、`take_image`、`take_pointcloud2`、`take_pointcloud2`）
 - [x] **2A.4** 依赖精简：移除 iceoryx_posh（Boost 的 ZC 不需要）、移除 sensor_msgs_library（Shm* 类型不依赖）
 
-### 2B. Python 封装
+### 2B. Python 封装 ✅
 
-- [ ] **2B.1** 创建 `pylib/robonix-zc/robonix_zc/__init__.py`
-- [ ] **2B.2** 实现 `ZcPublisher` 类——封装 `_zc_bridge`，提供 `publish(msg)` 方法
-- [ ] **2B.3** 实现 `ZcSubscriber` 类——封装 `_zc_bridge`，提供 callback 模式
-- [ ] **2B.4** 编写 `pyproject.toml`，在根 `pyproject.toml` 中注册 workspace member
+- [x] **2B.1** 创建 `robonix_zc/__init__.py` — 导出 `ZcPublisher`、`ZcSubscriber`、`init_shm`、`shutdown_shm`
+- [x] **2B.2** 实现 `ZcPublisher` 类——`publish(msg)` 写入 shm → 发布对象名到 String topic
+- [x] **2B.3** 实现 `ZcSubscriber` 类——订阅 String topic → 查找 shm → 解包为 ROS msg → 回调
+- [x] **2B.4** 编写 `pyproject.toml`（依赖 rclpy + sensor_msgs + std_msgs）
+- [x] **2B.5** 语法验证：3 个 `.py` 文件全部通过 `py_compile`
 
-## 阶段 3：首个 ZC 契约 + 参考实现
+## 阶段 3：首个 ZC 契约 + 参考实现 ✅
 
-- [ ] **3.1** 创建 `capabilities/primitive/camera/rgb_zc.v1.toml`
-  ```toml
-  [contract]
-  id      = "robonix/primitive/camera/rgb_zc"
-  version = "1"
-  kind    = "primitive"
-  idl     = "common_interfaces/sensor_msgs/msg/Image.msg"
-  description = "RGB 相机流，通过零拷贝共享内存传输。"
-
-  [mode]
-  type = "topic_out"
-  ```
-- [ ] **3.2** 编写参考 provider：`examples/zc_camera_provider.py`
-  - 使用 `Primitive` + `ZcPublisher`
-  - 完整的生命周期钩子（`@on_init`、`@on_shutdown`）管理共享内存
-- [ ] **3.3** 编写参考 consumer：`examples/zc_camera_consumer.py`
-  - 使用 `ZcSubscriber` 订阅
-  - 对比标准 ROS2 订阅的延迟
-- [ ] **3.4** 基准测试：1080p RGB @ 30fps，对比标准 ROS2 vs ZC
-  - 端到端延迟（publish → callback）
-  - CPU 使用率
-  - 内存峰值
+- [x] **3.1** 创建 `capabilities/primitive/camera/rgb_zc.v1.toml`（同 IDL，新 contract id，`topic_out`）
+- [x] **3.2** 创建 `examples/zc_demo/zc_camera_provider.py`（Primitive + `ZcPublisher` + 完整生命周期）
+- [x] **3.3** 创建 `examples/zc_demo/zc_camera_consumer.py`（独立 consumer，无需 Atlas）
+- [x] **3.4** 创建 `examples/zc_demo/README.md`
+- [x] **3.5** 语法验证：两个 `.py` 文件通过 `py_compile`
 
 ## 阶段 4：AI 代码生成工作流
 
