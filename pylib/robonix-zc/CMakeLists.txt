@@ -7,6 +7,11 @@ find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11_vendor QUIET)
 find_package(pybind11 QUIET)
 
+# ROS 2 packages (provide rclcpp::rclcpp, ${std_msgs_TARGETS}, etc.)
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+
 # librobonix_zc.so — exported by cpp_pubsub
 find_package(cpp_pubsub REQUIRED)
 
@@ -21,7 +26,7 @@ pybind11_add_module(_zc_bridge src/_zc_bridge.cpp)
 target_include_directories(_zc_bridge PRIVATE ${cpp_pubsub_INCLUDE_DIRS})
 
 target_link_libraries(_zc_bridge PRIVATE
-  robonix_zc
+  ${cpp_pubsub_LIBRARIES}
   rclcpp::rclcpp
   ${std_msgs_TARGETS}
   ${sensor_msgs_TARGETS})

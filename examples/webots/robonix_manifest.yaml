@@ -59,6 +59,9 @@ primitive:
     config: {}
 
 # after booted all the primitives, start the services
+  - name: camera_zc
+    path: ./primitives/camera_zc
+    config: {}
 service:
   # memsearch — default reference long-term-memory service for the
   # agent. Lives at services/memsearch in the robonix tree; pilot
