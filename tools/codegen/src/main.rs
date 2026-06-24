@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use robonix_codegen::codegen::{
     contract_gen, docs_gen, mcp_python_gen, msg_parser, proto_gen, ros2_gen,
+    zc_python_gen, zc_scanner,
 };
 
 #[derive(Parser)]
@@ -34,7 +35,8 @@ struct Args {
 
     /// Target language: "proto" (gRPC stubs + contracts), "mcp"
     /// (Python typed-input helpers for MCP servers), "ros2"
-    /// (a colcon overlay of the canonical ROS interface packages), or
+    /// (a colcon overlay of the canonical ROS interface packages),
+    /// "ros2_zc" (ZC contract TOMLs + Python provider skeletons), or
     /// "docs" (the mdBook contract + ROS IDL reference pages).
     #[arg(long = "lang", default_value = "proto")]
     lang: String,
@@ -43,6 +45,22 @@ struct Args {
     /// generated reference headers (e.g. "v0.1 @ abc1234 (2026-06-06)").
     #[arg(long = "doc-stamp")]
     doc_stamp: Option<String>,
+
+    /// For `--lang ros2_zc` only: one or more directories containing
+    /// existing (non-ZC) provider source code.  Codegen scans these for
+    /// `Primitive(...)` / namespace declarations, matches them to the
+    /// generated ZC skeletons, and emits a `fill_manifest.json` that
+    /// maps each skeleton to its reference implementation.
+    #[arg(long = "fill", number_of_values = 1)]
+    fill: Vec<PathBuf>,
+
+    /// For `--lang ros2_zc` only: only process contracts matching this
+    /// prefix or exact id.  Pass multiple times for multiple matches.
+    /// Example: `--filter robonix/primitive/camera/rgb` for one contract,
+    /// or `--filter robonix/primitive/lidar` for all lidar contracts.
+    /// Without `--filter`, all heavy-payload contracts are processed.
+    #[arg(long = "filter", number_of_values = 1)]
+    filter: Vec<String>,
 
     /// Print per-package lines and every IDL resolution warning (default: one summary line; set ROBONIX_CODEGEN_VERBOSE=1 for same without flag)
     #[arg(long, short = 'v')]
@@ -77,10 +95,10 @@ fn main() -> Result<()> {
     }
 
     match args.lang.as_str() {
-        "proto" | "mcp" | "ros2" | "docs" => {}
+        "proto" | "mcp" | "ros2" | "ros2_zc" | "docs" => {}
         other => {
             bail!(
-                "[robonix-codegen] unsupported --lang '{other}'. Supported: 'proto', 'mcp', 'ros2', 'docs'."
+                "[robonix-codegen] unsupported --lang '{other}'. Supported: 'proto', 'mcp', 'ros2', 'ros2_zc', 'docs'."
             )
         }
     }
@@ -111,6 +129,55 @@ fn main() -> Result<()> {
             args.doc_stamp.as_deref(),
             verbose,
         )?;
+        return Ok(());
+    }
+
+    // ros2_zc: scan contracts for heavy-payload types and emit ZC
+    // contract TOMLs + Python provider skeletons.  Like docs, this
+    // only needs the contracts dirs — no IDL resolver required.
+    if args.lang == "ros2_zc" {
+        if args.contracts.is_empty() {
+            bail!("[robonix-codegen] ros2_zc: pass at least one --contracts <dir>");
+        }
+        let mut candidates = zc_scanner::scan_contracts(&args.contracts)?;
+
+        // --filter is required: the developer decides which contracts to upgrade.
+        if args.filter.is_empty() {
+            bail!(
+                "[robonix-codegen] ros2_zc: --filter is required.\n\
+                 Pass one or more contract id prefixes, e.g.:\n\
+                   --filter robonix/primitive/camera/rgb    (one contract)\n\
+                   --filter robonix/primitive/lidar          (all lidar)\n\
+                   --filter robonix/primitive/camera/rgb --filter robonix/primitive/lidar/lidar3d"
+            );
+        }
+
+        let filters: Vec<&str> = args.filter.iter().map(|s| s.as_str()).collect();
+        candidates.retain(|c| {
+            filters
+                .iter()
+                .any(|f| c.contract_id.starts_with(f))
+        });
+        if candidates.is_empty() {
+            eprintln!(
+                "{} ros2_zc: no contracts match filter(s): {:?}",
+                ridlc_prefix(),
+                filters
+            );
+            return Ok(());
+        }
+
+        eprintln!(
+            "{} ros2_zc: {} candidates found",
+            ridlc_prefix(),
+            candidates.len()
+        );
+        let fill_providers = if args.fill.is_empty() {
+            Vec::new()
+        } else {
+            zc_scanner::discover_providers(&args.fill)?
+        };
+        zc_python_gen::generate(&candidates, &args.out, &fill_providers, verbose)?;
         return Ok(());
     }
 

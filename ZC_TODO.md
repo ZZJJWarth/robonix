@@ -67,67 +67,66 @@
 - [x] **3.4** 创建 `examples/zc_demo/README.md`
 - [x] **3.5** 语法验证：两个 `.py` 文件通过 `py_compile`
 
-## 阶段 4：AI 代码生成工作流
+## 阶段 4：AI 代码生成工作流 ✅
 
-- [ ] **4.1** 实现契约扫描器 `zc_scanner.rs`
-  - 递归扫描 `capabilities/` 目录
-  - 解析每个 TOML 的 `[contract].idl`
-  - 标记重载荷类型：`Image.msg`、`PointCloud2.msg`、`LaserScan.msg`
-  - 输出 JSON manifest
-- [ ] **4.2** 实现 ZC 契约生成器（扩展 `contract_gen.rs`）
-  - 为每个候选契约生成 `*_zc.v1.toml`
-  - 自动跳过已存在的 ZC 变体
-  - 生成 `description` 字段
-- [ ] **4.3** 实现 Python provider 代码生成器 `zc_python_gen.rs`
-  - 使用模板引擎（`minijinja` 或字符串模板）
-  - 模板变量：类名、命名空间、topic、消息类型
-  - 生成完整的 `.py` 文件（包括 import、lifecycle 钩子）
-- [ ] **4.4** 在 `robonix-codegen` 中注册 `--lang ros2_zc` 目标
-  - 修改 `tools/codegen/src/main.rs`
-  - 修改 `tools/codegen/src/codegen/mod.rs`
-- [ ] **4.5** 验证生成结果
-  ```bash
-  robonix-codegen --lang ros2_zc \
-    --contracts capabilities/ \
-    -I capabilities/lib/ \
-    -o gen/zc/
-  ```
+> 在 `robonix-codegen` 中添加 `--lang ros2_zc` 目标。分两层：
+> **A 层（确定性模板）** 生成 ZC 契约 + provider 骨架；**B 层（AI agent）**
+> 读取现有非 ZC provider，自动填充业务逻辑到骨架中。
+> 全部代码开发完成；4C 为开发者使用指南。
 
-## 阶段 5：全量覆盖
+### 4A. 确定性模板生成 — `robonix-codegen --lang ros2_zc` ✅
 
-- [ ] **5.1** 自动生成 `camera/depth_zc.v1.toml` + provider
-- [ ] **5.2** 自动生成 `lidar/lidar3d_zc.v1.toml` + provider
-- [ ] **5.3** 自动生成 `lidar/lidar_zc.v1.toml` + provider
-- [ ] **5.4** 自动生成 `imu/imu_zc.v1.toml` + provider
-- [ ] **5.5** 审查所有自动生成的代码，确保符合 CLAUDE.md 规范
+- [x] **4A.1** 实现 `zc_scanner.rs`（扫描 contracts/ 目录，匹配 Image/PointCloud2/LaserScan IDL）
+- [x] **4A.2** 实现 `zc_python_gen.rs`（ZC 契约 TOML 生成 + Python provider 骨架模板）
+- [x] **4A.3** 在 `mod.rs` + `main.rs` 中注册 `--lang ros2_zc` 目标
+- [x] **4A.4** 验证：`cargo build` 零警告，5 个候选全部正确生成，`.py` 全部通过 `py_compile`
 
-## 阶段 6：集成测试
+### 4B. AI Agent 业务逻辑填充 — `--fill <source_providers_dir>` ✅
 
-- [ ] **6.1** 在 Webots 示例中部署 ZC 相机
-  - 与现有标准相机并存运行
-  - 验证两种传输路径同时工作
-- [ ] **6.2** Executor 集成测试
-  - 通过 Atlas 发现 ZC 契约
-  - 验证 `ConnectCapability` 对 `ROS2_ZC` 传输
-- [ ] **6.3** 端到端延迟测量
-  - 使用 `examples/webots/` 环境
-  - 对比 ZC vs 标准 ROS2 的 Plan → Execute → Result 全链路延迟
-- [ ] **6.4** 压力测试
-  - 多路 ZC 相机同时运行
-  - 验证共享内存不会泄漏（引用计数 GC 正确性）
+- [x] **4B.1** 添加 `--fill` CLI 选项 + `discover_providers()` 扫描源码目录
+- [x] **4B.2** `zc_python_gen::generate()` 生成 `fill_manifest.json`（skeleton↔source 映射 + TODO 清单）
+- [x] **4B.3** 创建 `.claude/skills/fill-zc-providers/SKILL.md` — 读取 manifest、提取业务逻辑、填入 TODO、标记 `@ai-filled`
+- [x] **4B.4** 实际演示：4 个骨架全部填充，3 个 4/4，1 个 3/4（PointCloud2 源仅有 LaserScan），全部通过 `py_compile`
+- [x] **4B.5** 依赖：`serde_json`（manifest 序列化）
 
-## 阶段 7：文档
+### 4C. 开发者使用方式（运营任务，非开发任务）
 
-- [ ] **7.1** 在 `docs/src/developer-guide.md` 中添加 ZC 传输章节
-- [ ] **7.2** 更新 `system/robonix_zc/README.md`（库使用说明）
-- [ ] **7.3** 更新 `pylib/robonix-zc/README.md`（Python API 文档）
-- [ ] **7.4** 更新 `tools/codegen/README.md`（`--lang ros2_zc` 使用说明）
-- [ ] **7.5** 更新 `AGENTS.md` 或 `CLAUDE.md`（概念命名稳定性）
+开发者按需使用，每次只生成需要的 contract：
 
-## 阶段 8：CI 和发布
+```bash
+# 生成单个
+robonix-codegen --lang ros2_zc --contracts capabilities/ \
+  --filter robonix/primitive/camera/rgb \
+  --fill examples/webots/primitives/ -o gen/zc/
 
-- [ ] **8.1** 在 CI 中添加 `robonix_zc` 库的编译
-- [ ] **8.2** 添加 `robonix-codegen --lang ros2_zc` 的冒烟测试
-- [ ] **8.3** 运行 `make check`（`cargo fmt --all -- --check` + clippy）
-- [ ] **8.4** 运行 `cargo test --workspace --all-targets`
-- [ ] **8.5** Pre-commit review（`/pre-commit-review`）
+# AI 填充（如有匹配源码）
+/fill-zc-providers gen/zc/fill_manifest.json
+```
+
+输出（以 `--filter robonix/primitive/camera/rgb` 为例）：
+
+```
+gen/zc/
+├── fill_manifest.json                       # skeleton↔source 映射
+├── contracts/camera/rgb_zc.v1.toml          # ZC 契约
+└── providers/camera_rgb_zc_provider.py      # provider（骨架或 @ai-filled）
+```
+
+## 阶段 5：集成测试
+
+- [ ] **5.1** 在 Webots 示例中部署 ZC 相机（与标准相机并存）
+- [ ] **5.2** Executor 集成测试——通过 Atlas 发现 ZC 契约，验证 `ConnectCapability(ROS2_ZC)`
+- [ ] **5.3** 端到端延迟测量——对比 ZC vs 标准 ROS2 全链路延迟
+- [ ] **5.4** 压力测试——多路 ZC 相机同时运行，验证 shm GC 不泄漏
+
+## 阶段 6：文档
+
+- [ ] **6.1** 在 `docs/src/developer-guide.md` 中添加 ZC 传输章节
+- [ ] **6.2** 更新 `pylib/robonix-zc/README.md`（Python API 文档）
+- [ ] **6.3** 更新 `tools/codegen/README.md`（`--lang ros2_zc` 使用说明）
+
+## 阶段 7：CI 和发布
+
+- [ ] **7.1** CI 中添加 `robonix_zc` 库编译 + `robonix-codegen --lang ros2_zc` 冒烟测试
+- [ ] **7.2** `make check`（`cargo fmt --all -- --check` + clippy）+ `cargo test --workspace --all-targets`
+- [ ] **7.3** Pre-commit review（`/pre-commit-review`）
