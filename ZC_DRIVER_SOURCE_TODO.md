@@ -241,11 +241,11 @@ examples/zc_driver_patch/
 
 实施项：
 
-- [ ] **5.1** 编写 `Image` 驱动改造前后样例
-- [ ] **5.2** 编写 `PointCloud2` 驱动改造前后样例
-- [ ] **5.3** 样例展示如何使用同一 `SHM_NAME` / `TOPIC`
-- [ ] **5.4** 样例展示 fallback：保留或关闭原 ROS publisher
-- [ ] **5.5** 样例展示必要 CMake 修改
+- [x] **5.1** 编写 `Image` 驱动改造前后样例
+- [x] **5.2** 编写 `PointCloud2` 驱动改造前后样例
+- [x] **5.3** 样例展示如何使用同一 `SHM_NAME` / `TOPIC`
+- [x] **5.4** 样例展示 fallback：保留或关闭原 ROS publisher
+- [x] **5.5** 样例展示必要 CMake 修改
 
 验收：
 
