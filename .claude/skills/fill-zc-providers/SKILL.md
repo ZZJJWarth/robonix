@@ -7,6 +7,18 @@ description: Reads fill_manifest.json and fills TODO markers in generated ZC pro
 
 Reads `fill_manifest.json` (produced by `robonix-codegen --lang ros2_zc --fill`) and, for each entry that has a `source` match, reads both the source provider and the skeleton, then fills the TODO markers with extracted business logic.
 
+## Scope
+
+This skill fills generated **Python bridge** providers. A bridge provider may
+subscribe to an existing ROS 2 `Image` / `PointCloud2` topic and republish the
+payload through shared memory.
+
+This is not a full driver-source zero-copy optimization when the matched source
+already receives data from a ROS topic. In that case the original producer still
+pays the standard ROS 2 serialization, DDS, and copy costs before this bridge
+sees the message. Full source-side ZC requires patching the driver data
+production point so it writes `ShmImage` / `ShmPointCloud2` directly.
+
 ## When to use
 
 After running `robonix-codegen --lang ros2_zc --fill <providers_dir> -o gen/zc/`, when `fill_manifest.json` exists and has entries with `"source": "<path>"` (not null).
@@ -109,6 +121,13 @@ This is a valid migration pattern, but the ZC speed-up is **one-sided** (produce
 DDS cost).  The `fill_manifest.json` TODOs (`"init hardware SDK / driver"`, `"close hardware"`)
 are written for a direct-source provider, not a bridge.
 
+When a bridge is detected, add a warning comment near the file header:
+
+```
+# @ai-filled — WARNING: bridge provider only. Source-side ROS2 publish cost remains.
+# Full ZC optimization requires patching the driver to write shared memory directly.
+```
+
 When filling a **bridge** provider, replace those TODOs with accurate comments:
 
 - `"init hardware SDK / driver"` → `# bridge: no SDK to init — data comes from source ROS topic`
@@ -145,6 +164,13 @@ After processing all entries, print a summary table:
 ...
 
 Review each @ai-filled function before committing.
+```
+
+If an entry was filled as a bridge because the source subscribes to an
+existing ROS 2 topic, include a **WARNING** line after the table:
+
+```
+WARNING: camera_rgb_zc_provider.py is a bridge provider. Source-side ROS2 publish cost remains; full ZC requires patching the driver data-production point.
 ```
 
 If any entry was skipped due to msg_type mismatch, print a **WARNING** line after the table:

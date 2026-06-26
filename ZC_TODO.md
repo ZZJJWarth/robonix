@@ -73,6 +73,10 @@
 > **A 层（确定性模板）** 生成 ZC 契约 + provider 骨架；**B 层（AI agent）**
 > 读取现有非 ZC provider，自动填充业务逻辑到骨架中。
 > 全部代码开发完成；4C 为开发者使用指南。
+>
+> 注意：本阶段完成的是 Python bridge 生成路径。若 source provider
+> 本身订阅已有 ROS2 topic，则生成物只优化 bridge 之后的数据流；
+> 完整源头 ZC 优化仍需要改造驱动源码的数据产生/发布点。
 
 ### 4A. 确定性模板生成 — `robonix-codegen --lang ros2_zc` ✅
 

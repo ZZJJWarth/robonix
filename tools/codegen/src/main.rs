@@ -177,7 +177,7 @@ fn main() -> Result<()> {
         } else {
             zc_scanner::discover_providers(&args.fill)?
         };
-        zc_python_gen::generate(&candidates, &args.out, &fill_providers, verbose)?;
+        zc_python_gen::generate(&candidates, &args.out, &fill_providers, &args.fill, verbose)?;
         return Ok(());
     }
 
