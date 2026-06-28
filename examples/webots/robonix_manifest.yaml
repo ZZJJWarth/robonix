@@ -59,9 +59,9 @@ primitive:
     config: {}
 
 # after booted all the primitives, start the services
-  - name: camera_zc
-    path: ./primitives/camera_zc
-    config: {}
+  # - name: camera_zc
+  #   path: ./primitives/camera_zc
+  #   config: {}
 service:
   # memsearch — default reference long-term-memory service for the
   # agent. Lives at services/memsearch in the robonix tree; pilot
@@ -77,7 +77,7 @@ service:
   # consumers must come after their providers.
   - name: mapping
     url: https://github.com/enkerewpo/mapping_rbnx
-    branch: main
+    branch: fix/mapping-grid-autoadapt
     config:
       algo: rtabmap
       platform: x86_desktop

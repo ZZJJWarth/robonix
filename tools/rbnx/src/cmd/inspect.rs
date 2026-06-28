@@ -15,6 +15,7 @@ fn transport_name(t: i32) -> &'static str {
         atlas_pb::Transport::Grpc => "grpc",
         atlas_pb::Transport::Ros2 => "ros2",
         atlas_pb::Transport::Mcp => "mcp",
+        atlas_pb::Transport::Ros2Zc => "ros2_zc",
         atlas_pb::Transport::Unspecified => "?",
     }
 }

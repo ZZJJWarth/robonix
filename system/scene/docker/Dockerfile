@@ -97,7 +97,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # pip: do NOT use proxy.
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     without-proxy python3 -m pip install \
-        --progress-bar raw \
+        # --progress-bar raw \
         --timeout 60 \
         --retries 3 \
         --upgrade pip

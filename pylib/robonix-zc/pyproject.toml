@@ -4,11 +4,9 @@ version = "0.1.0"
 description = "Python zero-copy transport for ROS 2 heavy-payload messages (Image, PointCloud2)"
 license = "MulanPSL-2.0"
 requires-python = ">=3.10"
-dependencies = [
-    "rclpy",
-    "sensor_msgs",
-    "std_msgs",
-]
+# ROS Python packages are provided by the sourced ROS 2 environment, not PyPI.
+# Keep rclpy/sensor_msgs/std_msgs out of uv resolution.
+dependencies = []
 
 [build-system]
 requires = ["setuptools>=68"]
