@@ -1,25 +1,13 @@
 // SPDX-License-Identifier: MulanPSL-2.0
-// Generate ZC contract TOMLs and Python provider skeletons from a list of
-// `ZcCandidate`s produced by `zc_scanner`.
+// Generate ZC contract TOMLs and sidecars from a list of `ZcCandidate`s
+// produced by `zc_scanner`.
 
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::zc_scanner::{ProviderInfo, ZcCandidate};
-
-/// One entry in fill_manifest.json.
-#[derive(serde::Serialize)]
-struct FillManifestEntry {
-    skeleton: String,
-    source: Option<String>,
-    contract_id: String,
-    namespace: String,
-    msg_type: String,
-    generation_mode: &'static str,
-    todos: Vec<&'static str>,
-}
+use super::zc_scanner::ZcCandidate;
 
 /// One entry in zc_driver_patch_manifest.json.
 #[derive(serde::Serialize)]
@@ -46,26 +34,21 @@ struct DriverPatchRules {
     keep_legacy_ros_publish_optional: bool,
 }
 
-/// Emit ZC TOML contracts + Python provider skeletons + optional
-/// fill_manifest.json into `out_dir`.
+/// Emit ZC TOML contracts, Python sidecars, and optional driver patch
+/// manifests into `out_dir`.
 pub fn generate(
     candidates: &[ZcCandidate],
     out_dir: &Path,
-    fill_providers: &[ProviderInfo],
     fill_source_dirs: &[PathBuf],
     verbose: bool,
 ) -> Result<()> {
     let contracts_dir = out_dir.join("contracts");
-    let providers_dir = out_dir.join("providers");
     let sidecars_dir = out_dir.join("sidecars");
     fs::create_dir_all(&contracts_dir)?;
-    fs::create_dir_all(&providers_dir)?;
     fs::create_dir_all(&sidecars_dir)?;
 
     let mut n_contracts = 0usize;
-    let mut n_providers = 0usize;
     let mut n_sidecars = 0usize;
-    let mut manifest_entries: Vec<FillManifestEntry> = Vec::new();
 
     for cand in candidates {
         if verbose {
@@ -93,22 +76,6 @@ pub fn generate(
             n_contracts += 1;
         }
 
-        // ── Python provider skeleton ────────────────────────────────────────
-        let py_path = providers_dir.join(provider_filename(cand));
-        if py_path.exists() {
-            if verbose {
-                eprintln!(
-                    "[robonix-codegen] ros2_zc: skip existing {}",
-                    py_path.display()
-                );
-            }
-        } else {
-            let py_content = render_provider(cand);
-            fs::write(&py_path, &py_content)
-                .with_context(|| format!("write {}", py_path.display()))?;
-            n_providers += 1;
-        }
-
         // ── Python sidecar skeleton ────────────────────────────────────────
         let sidecar_path = sidecars_dir.join(sidecar_filename(cand));
         if sidecar_path.exists() {
@@ -124,43 +91,6 @@ pub fn generate(
                 .with_context(|| format!("write {}", sidecar_path.display()))?;
             n_sidecars += 1;
         }
-
-        // ── fill manifest entry ────────────────────────────────────────────
-        let source = fill_providers
-            .iter()
-            .find(|p| p.namespace == cand.namespace)
-            .map(|p| p.path.to_string_lossy().to_string());
-
-        manifest_entries.push(FillManifestEntry {
-            skeleton: py_path.to_string_lossy().to_string(),
-            source,
-            contract_id: cand.zc_contract_id.clone(),
-            namespace: cand.namespace.clone(),
-            msg_type: cand.msg_info.label.to_string(),
-            generation_mode: "python_bridge",
-            todos: vec![
-                "init hardware SDK / driver",
-                "start frame capture thread / callback",
-                "stop frame capture thread / callback",
-                "close hardware",
-            ],
-        });
-    }
-
-    // ── write fill_manifest.json ───────────────────────────────────────────
-    if !fill_providers.is_empty() {
-        let manifest_path = out_dir.join("fill_manifest.json");
-        let json = serde_json::to_string_pretty(&manifest_entries)?;
-        fs::write(&manifest_path, &json)
-            .with_context(|| format!("write {}", manifest_path.display()))?;
-        eprintln!(
-            "[robonix-codegen] ros2_zc: fill_manifest.json ({} entries, {} with source match)",
-            manifest_entries.len(),
-            manifest_entries
-                .iter()
-                .filter(|e| e.source.is_some())
-                .count()
-        );
     }
 
     let readme_path = sidecars_dir.join("README.md");
@@ -172,9 +102,8 @@ pub fn generate(
     }
 
     eprintln!(
-        "[robonix-codegen] ros2_zc: {} contracts, {} providers, {} sidecars -> {}",
+        "[robonix-codegen] ros2_zc: {} contracts, {} sidecars -> {}",
         n_contracts,
-        n_providers,
         n_sidecars,
         out_dir.display()
     );
@@ -199,18 +128,6 @@ fn contract_toml_path(contracts_dir: &Path, cand: &ZcCandidate) -> std::path::Pa
     };
 
     contracts_dir.join(domain).join(format!("{leaf}.v1.toml"))
-}
-
-fn provider_filename(cand: &ZcCandidate) -> String {
-    // "robonix/primitive/camera/rgb" -> "camera_rgb_zc_provider.py"
-    let parts: Vec<&str> = cand.contract_id.split('/').collect();
-    if parts.len() >= 3 {
-        let domain = parts[parts.len() - 2];
-        let leaf = parts[parts.len() - 1];
-        format!("{domain}_{leaf}_zc_provider.py")
-    } else {
-        format!("{}_zc_provider.py", cand.contract_id.replace('/', "_"))
-    }
 }
 
 fn sidecar_filename(cand: &ZcCandidate) -> String {
@@ -291,8 +208,8 @@ fn discover_cpp_candidate_files(dirs: &[PathBuf], msg_name: &str) -> Result<Vec<
 }
 
 /// Walk a directory tree and append matching C++ source/header files. Missing
-/// or non-directory inputs are ignored because `--fill` is also used for Python
-/// provider trees that may not contain driver-source C++.
+/// or non-directory inputs are ignored because `--fill` may include package
+/// trees that do not contain driver-source C++.
 fn collect_cpp_candidate_files(dir: &Path, msg_name: &str, out: &mut Vec<String>) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
@@ -390,167 +307,6 @@ type = "{mode}"
     )
 }
 
-// ── template: Python provider skeleton ──────────────────────────────────────
-
-fn render_provider(cand: &ZcCandidate) -> String {
-    let provider_id = provider_id(cand);
-    let topic = topic_name(cand);
-    let msg_label = msg_type_label(cand);
-    let shm_name = "robonix_zc";
-    let shm_size = 67_108_864u64; // 64 MiB
-
-    let mut out = String::new();
-
-    let _ = writeln!(out, "#!/usr/bin/env python3");
-    let _ = writeln!(out, "# @generated by robonix-codegen --lang ros2_zc");
-    let _ = writeln!(
-        out,
-        "# Zero-copy {msg_label} provider for contract `{zc_id}`.",
-        zc_id = cand.zc_contract_id
-    );
-    let _ = writeln!(out, "# Generation mode: python_bridge.");
-    let _ = writeln!(
-        out,
-        "# This compatibility bridge writes shared memory after receiving data in Python."
-    );
-    let _ = writeln!(
-        out,
-        "# Full source-side ZC requires patching the driver to write shared memory directly."
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "from __future__ import annotations");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "import logging");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "from robonix_api import Primitive, Ok");
-    let _ = writeln!(
-        out,
-        "from robonix_api.atlas_types import Transport, Ros2ZcParams"
-    );
-    let _ = writeln!(out, "from robonix_api.ros import RosBackend");
-    let _ = writeln!(
-        out,
-        "from robonix_zc import ZcPublisher, ZcSubscriber, init_shm, shutdown_shm"
-    );
-
-    // Import the right ROS message type.
-    let _ = writeln!(out, "{} as RosMsg", cand.msg_info.python_import);
-
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "log = logging.getLogger(\"{provider_id}\")",
-        provider_id = provider_id
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "SHM_NAME = \"{shm_name}\"");
-    let _ = writeln!(out, "SHM_SIZE = {shm_size}  # 64 MiB");
-    let _ = writeln!(out, "TOPIC    = \"{topic}\"");
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "# ── provider ───────────────────────────────────────────────────────────────"
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "provider = Primitive(");
-    let _ = writeln!(out, "    id=\"{provider_id}\",");
-    let _ = writeln!(
-        out,
-        "    namespace=\"{namespace}\",",
-        namespace = cand.namespace
-    );
-    let _ = writeln!(out, ")");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "_pub: ZcPublisher | None = None");
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "# ── lifecycle ──────────────────────────────────────────────────────────────"
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "@provider.on_init");
-    let _ = writeln!(out, "def init(cfg: dict) -> Ok | str:");
-    let _ = writeln!(out, "    global _pub");
-    let _ = writeln!(
-        out,
-        "    log.info(\"initialising shared memory: name=%s size=%d\", SHM_NAME, SHM_SIZE)"
-    );
-    let _ = writeln!(out, "    init_shm(SHM_NAME, SHM_SIZE)");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "    _pub = ZcPublisher(");
-    let _ = writeln!(out, "        node=RosBackend.get().node,");
-    let _ = writeln!(out, "        topic_name=TOPIC,");
-    let _ = writeln!(out, "        msg_type=RosMsg,");
-    let _ = writeln!(out, "        qos_profile=\"best_effort\",");
-    let _ = writeln!(out, "    )");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "    # Declare the ZC capability to Atlas");
-    let _ = writeln!(out, "    provider.declare_capability(");
-    let _ = writeln!(
-        out,
-        "        contract_id=\"{zc_id}\",",
-        zc_id = cand.zc_contract_id
-    );
-    let _ = writeln!(out, "        endpoint=TOPIC,");
-    let _ = writeln!(out, "        transport=Transport.ROS2_ZC,");
-    let _ = writeln!(out, "        params=Ros2ZcParams(");
-    let _ = writeln!(out, "            shm_name=SHM_NAME,");
-    let _ = writeln!(out, "            shm_size=SHM_SIZE,");
-    let _ = writeln!(out, "            qos_profile=\"best_effort\",");
-    let _ = writeln!(out, "        ),");
-    let _ = writeln!(
-        out,
-        "        description=\"{label} ZC stream\",",
-        label = msg_type_label(cand)
-    );
-    let _ = writeln!(out, "    )");
-    let _ = writeln!(
-        out,
-        "    log.info(\"declared {zc_id}\");",
-        zc_id = cand.zc_contract_id
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "    # TODO: initialise your hardware SDK / driver here"
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "    return Ok()");
-    let _ = writeln!(out);
-    let _ = writeln!(out);
-    let _ = writeln!(out, "@provider.on_activate");
-    let _ = writeln!(out, "def activate() -> Ok:");
-    let _ = writeln!(out, "    # TODO: start frame capture thread / callback.");
-    let _ = writeln!(out, "    # On each frame, call:");
-    let _ = writeln!(out, "    #     msg = RosMsg()");
-    let _ = writeln!(out, "    #     msg.data = ...   # raw payload");
-    let _ = writeln!(out, "    #     _pub.publish(msg)");
-    let _ = writeln!(out, "    return Ok()");
-    let _ = writeln!(out);
-    let _ = writeln!(out);
-    let _ = writeln!(out, "@provider.on_deactivate");
-    let _ = writeln!(out, "def deactivate() -> Ok:");
-    let _ = writeln!(out, "    # TODO: stop frame capture thread / callback");
-    let _ = writeln!(out, "    return Ok()");
-    let _ = writeln!(out);
-    let _ = writeln!(out);
-    let _ = writeln!(out, "@provider.on_shutdown");
-    let _ = writeln!(out, "def shutdown() -> None:");
-    let _ = writeln!(out, "    # TODO: close hardware");
-    let _ = writeln!(out, "    shutdown_shm(SHM_NAME)");
-    let _ = writeln!(out, "    log.info(\"shared memory released\")");
-    let _ = writeln!(out);
-    let _ = writeln!(out);
-    let _ = writeln!(out, "if __name__ == \"__main__\":");
-    let _ = writeln!(
-        out,
-        "    logging.basicConfig(level=logging.INFO, format=\"%(asctime)s %(levelname)-5s %(name)s: %(message)s\")"
-    );
-    let _ = writeln!(out, "    provider.run()");
-
-    out
-}
-
 /// Render a Python sidecar that owns Robonix registration and shared-memory
 /// lifecycle only. The sidecar intentionally does not subscribe to or publish
 /// ROS payload messages; the modified driver must write shared memory directly
@@ -599,6 +355,10 @@ fn render_sidecar(cand: &ZcCandidate) -> String {
     let _ = writeln!(out, "def init(cfg: dict) -> Ok | str:");
     let _ = writeln!(
         out,
+        "    \"\"\"Initialise shared memory and declare the ZC capability.\"\"\""
+    );
+    let _ = writeln!(
+        out,
         "    log.info(\"initialising shared memory: name=%s size=%d\", SHM_NAME, SHM_SIZE)"
     );
     let _ = writeln!(out, "    init_shm(SHM_NAME, SHM_SIZE)");
@@ -613,7 +373,7 @@ fn render_sidecar(cand: &ZcCandidate) -> String {
     let _ = writeln!(out, "        ),");
     let _ = writeln!(
         out,
-        "        description=\"{msg_label} ZC stream from patched driver\","
+        "        description=\"{msg_label} ZC stream from driver-side implementation\","
     );
     let _ = writeln!(out, "    )");
     let _ = writeln!(
@@ -628,19 +388,31 @@ fn render_sidecar(cand: &ZcCandidate) -> String {
     let _ = writeln!(out, "def activate() -> Ok:");
     let _ = writeln!(
         out,
-        "    log.info(\"sidecar active; patched driver must publish object names on %s\", TOPIC)"
+        "    \"\"\"Mark the capability active; driver-side code owns frame data.\"\"\""
+    );
+    let _ = writeln!(
+        out,
+        "    log.info(\"sidecar active; driver-side code must publish object names on %s\", TOPIC)"
     );
     let _ = writeln!(out, "    return Ok()");
     let _ = writeln!(out);
     let _ = writeln!(out);
     let _ = writeln!(out, "@sidecar.on_deactivate");
     let _ = writeln!(out, "def deactivate() -> Ok:");
+    let _ = writeln!(
+        out,
+        "    \"\"\"Mark the capability inactive without touching driver data flow.\"\"\""
+    );
     let _ = writeln!(out, "    log.info(\"sidecar inactive\")");
     let _ = writeln!(out, "    return Ok()");
     let _ = writeln!(out);
     let _ = writeln!(out);
     let _ = writeln!(out, "@sidecar.on_shutdown");
     let _ = writeln!(out, "def shutdown() -> None:");
+    let _ = writeln!(
+        out,
+        "    \"\"\"Release this process's shared-memory reference.\"\"\""
+    );
     let _ = writeln!(out, "    shutdown_shm(SHM_NAME)");
     let _ = writeln!(out, "    log.info(\"shared memory released\")");
     let _ = writeln!(out);
@@ -704,20 +476,6 @@ fn leaf_name(cand: &ZcCandidate) -> String {
         .map(|(_, leaf)| leaf)
         .unwrap_or(&cand.contract_id)
         .to_string()
-}
-
-fn provider_id(cand: &ZcCandidate) -> String {
-    // "robonix/primitive/camera/rgb" → "camera_rgb_zc_gen"
-    let parts: Vec<&str> = cand.contract_id.split('/').collect();
-    if parts.len() >= 3 {
-        format!(
-            "{}_{}_zc_gen",
-            parts[parts.len() - 2],
-            parts[parts.len() - 1]
-        )
-    } else {
-        format!("{}_zc_gen", cand.contract_id.replace('/', "_"))
-    }
 }
 
 fn sidecar_id(cand: &ZcCandidate) -> String {

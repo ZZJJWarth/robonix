@@ -1,7 +1,7 @@
 [project]
 name = "robonix-zc"
 version = "0.1.0"
-description = "Python zero-copy transport for ROS 2 heavy-payload messages (Image, PointCloud2)"
+description = "Python lifecycle helpers for Robonix zero-copy shared memory"
 license = "MulanPSL-2.0"
 requires-python = ">=3.10"
 # ROS Python packages are provided by the sourced ROS 2 environment, not PyPI.

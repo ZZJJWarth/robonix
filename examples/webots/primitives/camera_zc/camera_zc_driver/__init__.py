@@ -1,1 +1,1 @@
-# ZC providers package
+# ZC sidecars package

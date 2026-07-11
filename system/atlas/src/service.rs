@@ -749,7 +749,11 @@ fn parse_params(
             } else {
                 zc.shm_name
             },
-            shm_size: if zc.shm_size == 0 { 67_108_864 } else { zc.shm_size },
+            shm_size: if zc.shm_size == 0 {
+                67_108_864
+            } else {
+                zc.shm_size
+            },
             qos_profile: zc.qos_profile,
         },
     };

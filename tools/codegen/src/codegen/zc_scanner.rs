@@ -83,8 +83,7 @@ pub fn scan_contracts(contracts_dirs: &[PathBuf]) -> Result<Vec<ZcCandidate>> {
     let mut by_id: BTreeMap<String, (PathBuf, ContractToml)> = BTreeMap::new();
     for d in contracts_dirs {
         for p in collect_tomls(d)? {
-            let raw =
-                fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+            let raw = fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
             let c: ContractToml =
                 toml::from_str(&raw).with_context(|| format!("parse {}", p.display()))?;
             by_id.insert(c.contract.id.clone(), (p, c));
@@ -148,7 +147,7 @@ fn parse_msg_info(idl: &str) -> Option<ZcMsgInfo> {
     // Find /msg/ segment
     let parts: Vec<&str> = stem.split('/').collect();
     let n = parts.len();
-    if n < 2 {
+    if n < 3 {
         return None;
     }
     // The segment before the last should be "msg"
@@ -169,77 +168,6 @@ fn parse_msg_info(idl: &str) -> Option<ZcMsgInfo> {
     })
 }
 
-// ── provider discovery for --fill ───────────────────────────────────────────
-
-/// One existing provider discovered under a fill source directory.
-#[derive(Debug, Clone)]
-pub struct ProviderInfo {
-    /// Absolute path to the provider Python file.
-    pub path: PathBuf,
-    /// Provider id, e.g. "tiago_camera".
-    pub provider_id: String,
-    /// Namespace, e.g. "robonix/primitive/camera".
-    pub namespace: String,
-}
-
-/// Walk `dirs` for Python files containing `Primitive(` or `Service(` or
-/// `Skill(` calls, and extract their id + namespace.
-pub fn discover_providers(dirs: &[PathBuf]) -> Result<Vec<ProviderInfo>> {
-    let mut providers: Vec<ProviderInfo> = Vec::new();
-    for d in dirs {
-        walk_for_providers(d, &mut providers)?;
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    providers.retain(|p| seen.insert(p.provider_id.clone()));
-    Ok(providers)
-}
-
-fn walk_for_providers(dir: &Path, out: &mut Vec<ProviderInfo>) -> Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        let p = entry.path();
-        if p.is_dir() {
-            walk_for_providers(&p, out)?;
-        } else if p.extension().and_then(|x| x.to_str()) == Some("py") {
-            if let Some(info) = extract_provider_info(&p) {
-                out.push(info);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn extract_provider_info(path: &Path) -> Option<ProviderInfo> {
-    let content = fs::read_to_string(path).ok()?;
-    let id = extract_string_arg(&content, "id=")?;
-    let namespace = extract_string_arg(&content, "namespace=")?;
-    Some(ProviderInfo {
-        path: path.to_path_buf(),
-        provider_id: id,
-        namespace,
-    })
-}
-
-fn extract_string_arg(content: &str, key: &str) -> Option<String> {
-    let pos = content.find(key)?;
-    let rest = &content[pos + key.len()..];
-    let rest = rest.trim();
-    if let Some(rest) = rest.strip_prefix('"') {
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    } else if let Some(rest) = rest.strip_prefix('\'') {
-        let end = rest.find('\'')?;
-        Some(rest[..end].to_string())
-    } else {
-        let end = rest.find(|c: char| c == ',' || c == ')' || c == '\n' || c == ' ')?;
-        let val = rest[..end].trim();
-        if val.is_empty() { None } else { Some(val.to_string()) }
-    }
-}
-
 // ── TOML walk ───────────────────────────────────────────────────────────────
 
 fn collect_tomls(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -253,9 +181,7 @@ fn collect_tomls_inner(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !dir.is_dir() {
         anyhow::bail!("contracts directory does not exist: {}", dir.display());
     }
-    for entry in
-        fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
-    {
+    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         let p = entry.path();
         if p.is_dir() {

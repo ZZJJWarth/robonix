@@ -1,11 +1,10 @@
 # robonix-zc
 
-Python helpers for Robonix zero-copy ROS 2 message transport.
+Python lifecycle helpers for Robonix zero-copy shared memory.
 
-This package wraps the native shared-memory bridge used by generated ZC
-providers and sidecars. It expects ROS 2 Python packages such as `rclpy`,
-`sensor_msgs`, and `std_msgs` to come from the active ROS environment, for
-example after sourcing `/opt/ros/<distro>/setup.bash`.
+This package exposes `init_shm` and `shutdown_shm` for generated sidecars.
+Frame data is written and read by the driver-side zero-copy implementation,
+not by Python ROS 2 topic subscribers.
 
 Do not add ROS 2 packages to `pyproject.toml` dependencies. They are not PyPI
 packages, and adding them makes `uv sync` fail during workspace resolution.

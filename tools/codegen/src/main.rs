@@ -8,8 +8,8 @@ use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use robonix_codegen::codegen::{
-    contract_gen, docs_gen, mcp_python_gen, msg_parser, proto_gen, ros2_gen,
-    zc_python_gen, zc_scanner,
+    contract_gen, docs_gen, mcp_python_gen, msg_parser, proto_gen, ros2_gen, zc_python_gen,
+    zc_scanner,
 };
 use robonix_scribe::info;
 
@@ -37,7 +37,7 @@ struct Args {
     /// Target language: "proto" (gRPC stubs + contracts), "mcp"
     /// (Python typed-input helpers for MCP servers), "ros2"
     /// (a colcon overlay of the canonical ROS interface packages),
-    /// "ros2_zc" (ZC contract TOMLs + Python provider skeletons), or
+    /// "ros2_zc" (ZC contract TOMLs + Python sidecars), or
     /// "docs" (the mdBook contract + ROS IDL reference pages).
     #[arg(long = "lang", default_value = "proto")]
     lang: String,
@@ -48,10 +48,8 @@ struct Args {
     doc_stamp: Option<String>,
 
     /// For `--lang ros2_zc` only: one or more directories containing
-    /// existing (non-ZC) provider source code.  Codegen scans these for
-    /// `Primitive(...)` / namespace declarations, matches them to the
-    /// generated ZC skeletons, and emits a `fill_manifest.json` that
-    /// maps each skeleton to its reference implementation.
+    /// driver source code. Codegen scans these for candidate C++ files
+    /// and emits `zc_driver_patch_manifest.json`.
     #[arg(long = "fill", number_of_values = 1)]
     fill: Vec<PathBuf>,
 
@@ -135,8 +133,8 @@ fn main() -> Result<()> {
     }
 
     // ros2_zc: scan contracts for heavy-payload types and emit ZC
-    // contract TOMLs + Python provider skeletons.  Like docs, this
-    // only needs the contracts dirs — no IDL resolver required.
+    // contract TOMLs + Python sidecars. Like docs, this only needs the
+    // contracts dirs; `--fill` optionally scans driver source files.
     if args.lang == "ros2_zc" {
         if args.contracts.is_empty() {
             bail!("[robonix-codegen] ros2_zc: pass at least one --contracts <dir>");
@@ -155,11 +153,7 @@ fn main() -> Result<()> {
         }
 
         let filters: Vec<&str> = args.filter.iter().map(|s| s.as_str()).collect();
-        candidates.retain(|c| {
-            filters
-                .iter()
-                .any(|f| c.contract_id.starts_with(f))
-        });
+        candidates.retain(|c| filters.iter().any(|f| c.contract_id.starts_with(f)));
         if candidates.is_empty() {
             eprintln!(
                 "{} ros2_zc: no contracts match filter(s): {:?}",
@@ -174,12 +168,7 @@ fn main() -> Result<()> {
             ridlc_prefix(),
             candidates.len()
         );
-        let fill_providers = if args.fill.is_empty() {
-            Vec::new()
-        } else {
-            zc_scanner::discover_providers(&args.fill)?
-        };
-        zc_python_gen::generate(&candidates, &args.out, &fill_providers, &args.fill, verbose)?;
+        zc_python_gen::generate(&candidates, &args.out, &args.fill, verbose)?;
         return Ok(());
     }
 
