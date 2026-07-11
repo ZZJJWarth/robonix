@@ -321,10 +321,18 @@ def _render_start_sh(
             env_block = ""
         launches += f"""docker exec -i -d \\
 {env_block}  -e ROBONIX_ATLAS="${{ROBONIX_ATLAS:-127.0.0.1:50051}}" \\
-  -e PYTHONPATH="/robonix_pkgs/pylib/robonix-api:/robonix_pkgs/pylib/robonix-zc/install/robonix_zc/lib/python3.*/site-packages" \\
   robonix_tiago_sim \\
   bash -lc 'set -eo pipefail
             source /opt/ros/humble/setup.bash
+            zc_site=""
+            for path in /robonix_pkgs/pylib/robonix-zc/install/robonix_zc/lib/python3*/site-packages; do
+              if [ -d "$path" ]; then zc_site="$path"; break; fi
+            done
+            if [ -z "$zc_site" ]; then
+              echo "[{pkg_name}] error: robonix_zc site-packages not found" >&2
+              exit 1
+            fi
+            export PYTHONPATH="/robonix_pkgs/pylib/robonix-api:${{zc_site}}:${{PYTHONPATH:-}}"
             cd /robonix_pkgs/primitives/{pkg_name}
             exec python3 -m {driver_name}_driver.{mod}' &
 """

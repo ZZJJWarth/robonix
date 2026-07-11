@@ -19,18 +19,34 @@ trap cleanup EXIT INT TERM
 echo "[camera_zc] launching ZC providers..."
 docker exec -i -d \
   -e ROBONIX_ATLAS="${ROBONIX_ATLAS:-127.0.0.1:50051}" \
-  -e PYTHONPATH="/robonix_pkgs/pylib/robonix-api:/robonix_pkgs/pylib/robonix-zc/install/robonix_zc/lib/python3.*/site-packages" \
   robonix_tiago_sim \
   bash -lc 'set -eo pipefail
             source /opt/ros/humble/setup.bash
+            zc_site=""
+            for path in /robonix_pkgs/pylib/robonix-zc/install/robonix_zc/lib/python3*/site-packages; do
+              if [ -d "$path" ]; then zc_site="$path"; break; fi
+            done
+            if [ -z "$zc_site" ]; then
+              echo "[camera_zc] error: robonix_zc site-packages not found" >&2
+              exit 1
+            fi
+            export PYTHONPATH="/robonix_pkgs/pylib/robonix-api:${zc_site}:${PYTHONPATH:-}"
             cd /robonix_pkgs/primitives/camera_zc
             exec python3 -m camera_zc_driver.camera_depth_zc_provider' &
 docker exec -i -d \
   -e ROBONIX_ATLAS="${ROBONIX_ATLAS:-127.0.0.1:50051}" \
-  -e PYTHONPATH="/robonix_pkgs/pylib/robonix-api:/robonix_pkgs/pylib/robonix-zc/install/robonix_zc/lib/python3.*/site-packages" \
   robonix_tiago_sim \
   bash -lc 'set -eo pipefail
             source /opt/ros/humble/setup.bash
+            zc_site=""
+            for path in /robonix_pkgs/pylib/robonix-zc/install/robonix_zc/lib/python3*/site-packages; do
+              if [ -d "$path" ]; then zc_site="$path"; break; fi
+            done
+            if [ -z "$zc_site" ]; then
+              echo "[camera_zc] error: robonix_zc site-packages not found" >&2
+              exit 1
+            fi
+            export PYTHONPATH="/robonix_pkgs/pylib/robonix-api:${zc_site}:${PYTHONPATH:-}"
             cd /robonix_pkgs/primitives/camera_zc
             exec python3 -m camera_zc_driver.camera_rgb_zc_provider' &
 
