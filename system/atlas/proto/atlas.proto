@@ -85,8 +85,11 @@ enum Transport {
   TRANSPORT_GRPC = 1;
   TRANSPORT_ROS2 = 2;
   TRANSPORT_MCP = 3;
-  // Zero-copy ROS 2: data sits in Boost.Interprocess shared memory;
-  // only an object name ("ShmObject_N") is published over the ROS topic.
+  // Experimental zero-copy ROS 2 transport. Data sits in
+  // Boost.Interprocess shared memory; only an object name ("ShmObject_N")
+  // is published over the ROS topic. This transport is for current ZC
+  // prototypes and is not part of the v0.1 stable compatibility promise;
+  // its fields and semantics may change.
   TRANSPORT_ROS2_ZC = 4;
 }
 
@@ -187,6 +190,8 @@ message McpParams {
   string input_schema_json = 1;
 }
 
+// Experimental params for TRANSPORT_ROS2_ZC. These describe the current
+// shared-memory prototype and are not a stable v0.1 API contract.
 message Ros2ZcParams {
   // Shared-memory segment name. Providers sharing the same segment
   // MUST use the same name. Default: "robonix_zc".

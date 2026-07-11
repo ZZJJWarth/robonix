@@ -57,6 +57,12 @@ class McpParams:
 
 @dataclass(frozen=True, slots=True)
 class Ros2ZcParams:
+    """Experimental params for Transport.ROS2_ZC.
+
+    The current shared-memory fields are not part of the v0.1 stability
+    promise and may change before this transport is promoted.
+    """
+
     shm_name: str = "robonix_zc"
     shm_size: int = 67108864  # 64 MiB
     qos_profile: str = ""

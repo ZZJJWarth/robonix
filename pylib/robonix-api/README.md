@@ -58,7 +58,7 @@ The Atlas wire protocol (atlas_pb2 / atlas_pb2_grpc) is pre-generated and bundle
 
 ## Versioning
 
-`robonix-api` tracks the Robonix v0.1.x series. Wire format and public API are frozen within v0.1.x. Pre-release builds (`0.1.0rc*`) are published to Test PyPI first; stable releases to PyPI.
+`robonix-api` tracks the Robonix v0.1.x series. Wire format and public API are frozen within v0.1.x. Pre-release builds (`0.1.0rc*`) are published to Test PyPI first; stable releases to PyPI. Experimental zero-copy transport entries, such as `Transport.ROS2_ZC` and `Ros2ZcParams`, are excluded from this stability promise until promoted.
 
 The Atlas server (Rust crate `robonix-atlas`) must be on a compatible minor version. Mixing `robonix-api 0.1.x` with an Atlas server on a different minor version is unsupported.
 
