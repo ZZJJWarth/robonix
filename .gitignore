@@ -46,7 +46,7 @@ venv/
 rbnx-build/
 
 # generated code output
-/gen/
+/gen
 
 # rbnx deploy
 rbnx-deploy/
