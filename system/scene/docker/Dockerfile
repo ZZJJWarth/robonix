@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # SPDX-License-Identifier: MulanPSL-2.0
-# system/scene container — ROS Humble base + scene's Python deps.
+# system/scene container — ROS 2 base + scene's Python deps.
 #
 # Why scene gets its own image (and isn't, say, exec'd into the
 # webots sim container): scene is a system service that should be
@@ -10,8 +10,17 @@
 # bus, which `--network host` gives us regardless of where the sim
 # is running.
 #
+# ROS distro is NOT hard-pinned: Robonix does not bind to a single ROS
+# release. Pick it with the `ROS_DISTRO` build arg (default `humble`); the
+# base image, the `ros-<distro>-*` apt packages, and the runtime
+# `source /opt/ros/<distro>/setup.bash` all follow it. Supported distros
+# (have the tf2 + zenoh-bridge packages scene needs): humble (default,
+# verified), iron, jazzy, rolling. Set it with
+# `ROBONIX_SCENE_ROS_DISTRO=iron rbnx build -p system/scene` (build.sh wires
+# the env var to this build arg) — see the scene README "ROS distro" section.
+#
 # Layout inside the image:
-#   /opt/ros/humble/...       ROS Humble (from base)
+#   /opt/ros/$ROS_DISTRO/...  ROS 2 (from base; $ROS_DISTRO set by the base)
 #   /scene                    package dir, bind-mounted at runtime
 #                             (so live edits don't need image rebuild)
 #   /entrypoint.sh            sources ros + execs scene_service.service
@@ -20,7 +29,13 @@
 # the first time, then reused. Rebuild only when this Dockerfile or
 # requirements/ change.
 
-FROM ros:humble-ros-base
+# Selects the ROS package names + runtime setup.bash path. build.sh also passes
+# ROS_BASE_IMAGE, defaulting to a local robonix-ros:<distro>-ros-base alias so
+# BuildKit does not query Docker Hub metadata on every rebuild. Override with
+# ROBONIX_SCENE_ROS_BASE_IMAGE for a mirror, digest-pinned base, or custom image.
+ARG ROS_DISTRO=humble
+ARG ROS_BASE_IMAGE=robonix-ros:humble-ros-base
+FROM ${ROS_BASE_IMAGE}
 
 # ── Build-time proxy helpers ──────────────────────────────────────
 # Usage:
@@ -56,7 +71,7 @@ unset ALL_PROXY all_proxy NO_PROXY no_proxy
 exec "$@"
 EOF2
 
-# ── TUNA mirrors for GFW-bound networks ─────────────────────────────
+# ── TUNA mirrors ───────────────────────────────────────────────────
 RUN set -eux; \
     find /etc/apt/sources.list.d/ -maxdepth 1 \( -name '*.list' -o -name '*.sources' \) -print0 \
       | xargs -0 -r sed -i --follow-symlinks \
@@ -87,17 +102,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
             python3-pip \
             python3-cv-bridge \
             python3-numpy \
-            ros-humble-tf2-ros \
-            ros-humble-tf-transformations \
-            ros-humble-rmw-zenoh-cpp \
-            ros-humble-zenoh-bridge-dds && \
+            ros-$ROS_DISTRO-tf2-ros \
+            ros-$ROS_DISTRO-tf-transformations \
+            ros-$ROS_DISTRO-rmw-zenoh-cpp \
+            ros-$ROS_DISTRO-zenoh-bridge-dds && \
         rm -rf /var/lib/apt/lists/* \
     '
 
 # pip: do NOT use proxy.
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     without-proxy python3 -m pip install \
-        # --progress-bar raw \
+        --progress-bar on \
         --timeout 60 \
         --retries 3 \
         --upgrade pip
@@ -106,16 +121,32 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 # torch 2.7+ with CUDA 12.8 kernels. cu124 wheels only cover up to
 # sm_90 and will fail with "no kernel image" on Blackwell.
 # Aliyun mirror carries cu128 wheels; fall back to upstream PyTorch index.
+# torch / torchvision cu128 only live on the aliyun pytorch-wheels mirror
+# (TUNA has no cu128), so curl those two big wheels from aliyun — curl's
+# -C - (resume) + --retry saturates the link (~11 MB/s), whereas pip's
+# downloader does NOT resume and dies in an infinite restart loop when the
+# aliyun mirror stalls a ~1 GB transfer partway. The nvidia-* deps are then
+# resolved by pip from the default PIP_INDEX_URL (TUNA, set above) — do NOT
+# point pip at aliyun's pypi index here, its large-file throttling stalls
+# pip the same way.
+# The saved filenames MUST be the canonical wheel names (pip parses the
+# name/version/abi from the filename and rejects e.g. "torch.whl" with
+# "Invalid wheel filename"), which would silently drop every build into
+# the slow fallback below after wasting the full aliyun download.
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    without-proxy python3 -m pip install \
-        --progress-bar raw \
-        --timeout 60 \
-        --retries 3 \
-        -i https://mirrors.aliyun.com/pypi/simple/ \
-        --find-links https://mirrors.aliyun.com/pytorch-wheels/cu128/ \
-        torch==2.7.1 torchvision==0.22.1 \
+    without-proxy sh -c 'set -eu; \
+        base="https://mirrors.aliyun.com/pytorch-wheels/cu128"; \
+        tw="torch-2.7.1+cu128-cp310-cp310-manylinux_2_28_x86_64.whl"; \
+        tvw="torchvision-0.22.1+cu128-cp310-cp310-manylinux_2_28_x86_64.whl"; \
+        curl -fSL --retry 5 --retry-delay 2 -C - -o "/tmp/$tw" \
+             "$base/torch-2.7.1%2Bcu128-cp310-cp310-manylinux_2_28_x86_64.whl"; \
+        curl -fSL --retry 5 --retry-delay 2 -C - -o "/tmp/$tvw" \
+             "$base/torchvision-0.22.1%2Bcu128-cp310-cp310-manylinux_2_28_x86_64.whl"; \
+        python3 -m pip install --progress-bar on --timeout 60 --retries 3 \
+             "/tmp/$tw" "/tmp/$tvw"; \
+        rm -f "/tmp/$tw" "/tmp/$tvw"' \
     || with-build-proxy python3 -m pip install \
-        --progress-bar raw \
+        --progress-bar on \
         --timeout 60 \
         --retries 3 \
         --index-url https://download.pytorch.org/whl/cu128 \
@@ -128,7 +159,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 COPY requirements/scene-base.txt /tmp/requirements/scene-base.txt
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     without-proxy pip install -r /tmp/requirements/scene-base.txt \
-        --progress-bar raw \
+        --progress-bar on \
         --timeout 60 \
         --retries 3 \
     && rm /tmp/requirements/scene-base.txt
@@ -137,7 +168,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 COPY requirements/scene-perception-core.txt /tmp/requirements/scene-perception-core.txt
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     without-proxy pip install -r /tmp/requirements/scene-perception-core.txt \
-        --progress-bar raw \
+        --progress-bar on \
         --timeout 60 \
         --retries 3 \
     && rm /tmp/requirements/scene-perception-core.txt
@@ -146,7 +177,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 COPY requirements/scene-perception-heavy.txt /tmp/requirements/scene-perception-heavy.txt
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     without-proxy pip install -r /tmp/requirements/scene-perception-heavy.txt \
-        --progress-bar raw \
+        --progress-bar on \
         --timeout 60 \
         --retries 3 \
     && rm /tmp/requirements/scene-perception-heavy.txt
@@ -155,7 +186,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 # COPY requirements/scene-pytorch3d.txt /tmp/requirements/scene-pytorch3d.txt
 # RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 #     without-proxy pip install -r /tmp/requirements/scene-pytorch3d.txt \
-#         --progress-bar raw \
+#         --progress-bar on \
 #         --timeout 60 \
 #         --retries 3 \
 #     && rm /tmp/requirements/scene-pytorch3d.txt
@@ -187,27 +218,75 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     without-proxy pip install --no-deps -e /opt/concept-graphs
 
 # Bake CV model weights into the image.
-ENV HF_HOME=/opt/models/hf
+ENV HF_HOME=/opt/models/hf \
+    YOLO_CONFIG_DIR=/opt/ultralytics
 
-RUN mkdir -p /opt/models /opt/models/hf /root/.cache/clip
+RUN mkdir -p /opt/models /opt/models/hf /opt/models/ultralytics /opt/ultralytics
 
 COPY _weights/yolov8l-world.pt /opt/models/yolov8l-world.pt
 COPY _weights/mobile_sam.pt    /opt/models/mobile_sam.pt
 
 # Two CLIP-flavored downloads bake in here:
 #   1. open_clip's ViT-B-32 LAION-2B — goes to HF_HOME.
-#   2. openai's `clip` ViT-B/32 — goes to /root/.cache/clip.
+#   2. Ultralytics YOLO-World's text encoder — goes to the Ultralytics
+#      weights_dir under /opt/models/ultralytics.
 #
-# Non-pip model downloads: use proxy.
+# Non-pip model downloads. CN-native: open_clip's weights come from the HF
+# mirror (HF_ENDPOINT, set above). Ultralytics uses openai/clip internally from
+# YOLOWorld.set_classes(); run that exact path at build time so start never
+# downloads the 354 MB ViT-B-32.pt into /scene/weights/clip.
 RUN with-build-proxy sh <<'EOF'
 set -eux
-unset HF_ENDPOINT
+export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_DOWNLOAD_TIMEOUT=120
+export YOLO_CONFIG_DIR=/opt/ultralytics
 
 python3 -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')"
-python3 -c "import clip; clip.load('ViT-B/32', device='cpu', download_root='/root/.cache/clip')"
 
-ls -la /opt/models/ /root/.cache/clip/
+python3 - <<'PY'
+from ultralytics.utils import SETTINGS
+
+SETTINGS.update({
+    "weights_dir": "/opt/models/ultralytics",
+    "datasets_dir": "/tmp/ultralytics/datasets",
+    "runs_dir": "/tmp/ultralytics/runs",
+    "sync": False,
+})
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+from ultralytics.utils import WEIGHTS_DIR
+
+expected = Path("/opt/models/ultralytics")
+if Path(WEIGHTS_DIR) != expected:
+    raise RuntimeError(f"Ultralytics WEIGHTS_DIR={WEIGHTS_DIR!s}, expected {expected!s}")
+
+from ultralytics import YOLO
+
+classes = [
+    "chair", "table", "desk", "couch", "sofa", "bookshelf", "shelf",
+    "cabinet", "drawer", "whiteboard",
+    "monitor", "laptop", "keyboard", "mouse", "computer tower",
+    "monitor stand", "headphones", "webcam", "router", "power strip",
+    "cup", "mug", "water bottle", "thermos", "paper cup",
+    "backpack", "handbag", "book", "notebook", "pen", "pencil",
+    "phone", "tablet",
+    "box", "cardboard box", "tray", "basket", "trash bin",
+    "tool", "screwdriver", "wrench", "tape",
+    "plant", "potted plant", "lamp", "clock", "picture frame",
+    "snack", "fruit", "apple", "banana",
+    "door", "doorway", "fire extinguisher", "person",
+]
+
+model = YOLO("/opt/models/yolov8l-world.pt")
+model.set_classes(classes)
+PY
+
+test -s /opt/models/ultralytics/clip/ViT-B-32.pt
+chmod -R a+rX,u+rwX /opt/ultralytics /opt/models/ultralytics
+
+ls -la /opt/models/ /opt/models/ultralytics/clip/
 EOF
 
 # No global proxy ENV was set, so there is no build-time proxy to clear here.
@@ -216,6 +295,7 @@ EOF
 # live without each deployment having to override.
 ENV SCENE_YOLO_WORLD_WEIGHTS=/opt/models/yolov8l-world.pt \
     SCENE_MOBILE_SAM_WEIGHTS=/opt/models/mobile_sam.pt \
+    YOLO_CONFIG_DIR=/opt/ultralytics \
     SCENE_CLIP_MODEL=ViT-B-32 \
     SCENE_CLIP_PRETRAINED=laion2b_s34b_b79k
 
@@ -226,10 +306,9 @@ COPY no_shm_profile.xml /etc/fastrtps_no_shm.xml
 
 RUN chmod +x /entrypoint.sh
 
-# Force FastRTPS to skip SHM transport.
+# Left for operators who explicitly override RMW back to FastRTPS.
 ENV FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fastrtps_no_shm.xml
 
-# Stick with FastRTPS.
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
 ENTRYPOINT ["/entrypoint.sh"]
