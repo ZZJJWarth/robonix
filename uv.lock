@@ -4218,7 +4218,6 @@ dependencies = [
     { name = "onnxruntime", version = "1.18.1", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "platform_machine == 'aarch64'" },
     { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "platform_machine != 'aarch64'" },
     { name = "protobuf" },
-    { name = "requests" },
     { name = "robonix-api" },
     { name = "uvicorn" },
 ]
@@ -4305,7 +4304,6 @@ local = [
     { name = "torch", marker = "platform_machine != 'aarch64'" },
     { name = "torchaudio", marker = "platform_machine != 'aarch64'" },
     { name = "transformers" },
-    { name = "websockets" },
 ]
 
 [package.metadata]
