@@ -1,6 +1,7 @@
-FROM osrf/ros:humble-desktop
+ARG ROS_BASE_IMAGE=osrf/ros:humble-desktop
+FROM ${ROS_BASE_IMAGE}
 
-# ── TUNA mirrors for GFW-bound networks ─────────────────────────────
+# ── TUNA mirrors ───────────────────────────────────────────────────
 # Swap apt sources (Ubuntu/ports + ROS 2) to TUNA. Use `find` + sed
 # --follow-symlinks because /etc/apt/sources.list.d/ros2.sources is
 # a symlink into /usr/share/ros-apt-source/ in the upstream ros image.

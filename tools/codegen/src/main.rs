@@ -11,6 +11,7 @@ use robonix_codegen::codegen::{
     contract_gen, docs_gen, mcp_python_gen, msg_parser, proto_gen, ros2_gen,
     zc_python_gen, zc_scanner,
 };
+use robonix_scribe::info;
 
 #[derive(Parser)]
 #[command(name = "robonix-codegen")]
@@ -86,7 +87,8 @@ fn verbose_from_args_and_env(args: &Args) -> bool {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    robonix_scribe::init("codegen");
+    info!("robonix-codegen starting");
     let args = Args::parse();
     let verbose = verbose_from_args_and_env(&args);
 

@@ -1,9 +1,11 @@
-# Robonix speech service — ASR (Whisper one-shot + FunASR streaming) +
-# TTS (Edge TTS) + Dialog manager. Declares 5 data-plane gRPC contracts
+# Robonix speech service — ASR/TTS + Dialog manager. The default backend is
+# local (Whisper one-shot + FunASR streaming + Edge TTS); `speech_backend:
+# tencent` switches ASR/TTS to Tencent Cloud APIs. Declares 5 data-plane gRPC contracts
 # and a driver lifecycle contract so `rbnx boot` ships the boot
 # manifest's `system: speech: {...}` block as Driver(CMD_INIT, config_json).
 #
 # Config schema consumed by the on_init handler (see speech_service.service):
+#   speech_backend:    str   — local | tencent (default: local)
 #   disable_whisper:   bool  — skip Whisper backend entirely (asr returns UNAVAILABLE)
 #   asr_model:         str   — Whisper model id / path (default: openai/whisper-large-v3)
 #   asr_device:        str   — cuda | cpu (default: cuda)
@@ -13,6 +15,18 @@
 #   funasr_device:     str   — auto | cuda | cpu (default: auto — try GPU then fall back to CPU on OOM)
 #   funasr_chunk_size: list  — Paraformer [left, current, right] (default: [0,10,5])
 #   tts_voice:         str   — Edge TTS voice (default: zh-CN-XiaoxiaoNeural)
+#   default_speaker_provider_id: str — provider id used by speech/speak when
+#       its request target is empty; explicit request target overrides this
+#   tencent_asr_appid: str   — Tencent Cloud ASR AppID (secret id/key stay in env)
+#   tencent_asr_engine: str  — default 16k_zh_en
+#   tencent_asr_host: str    — default asr.cloud.tencent.com
+#   tencent_tts_voice_type: int — default 1001
+#   tencent_tts_region: str — default ap-guangzhou
+#   tencent_tts_model_type: int — default 1
+#   tencent_tts_sample_rate: int — default 16000
+#   tencent_tts_codec: str — default pcm
+#   tencent_tts_primary_language: int — optional 1=Chinese, 2=English;
+#       omit for automatic Chinese/English selection per utterance
 #   log:               str   — log level (default: info)
 manifestVersion: 1
 
@@ -36,6 +50,11 @@ start: |
   # split the log in half and leave the boot-side log empty, which is
   # exactly what bit us debugging the FunASR loader.
   exec rbnx-build/venv/bin/python -m speech_service.service
+
+stop: |
+  pkill -TERM -f "[p]ython -m speech_service.service|[p]ython3 -m speech_service.service|[s]peech_service.service" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "[p]ython -m speech_service.service|[p]ython3 -m speech_service.service|[s]peech_service.service" 2>/dev/null || true
 
 capabilities:
   - name: robonix/service/speech/driver

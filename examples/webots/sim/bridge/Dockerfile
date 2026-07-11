@@ -5,9 +5,10 @@
 # code. Driver code lives in each primitive/service package directory
 # on the host and is bind-mounted in by compose.yaml under /robonix_pkgs.
 # Build context = the directory containing this Dockerfile (sim/bridge/).
-FROM osrf/ros:humble-desktop-full
+ARG ROS_BASE_IMAGE=osrf/ros:humble-desktop-full
+FROM ${ROS_BASE_IMAGE}
 
-# ── TUNA mirrors for GFW-bound networks ─────────────────────────────
+# ── TUNA mirrors ───────────────────────────────────────────────────
 # Swap apt sources (Ubuntu/ports + ROS 2) to TUNA. Use `find` + sed
 # --follow-symlinks because /etc/apt/sources.list.d/ros2.sources is
 # a symlink into /usr/share/ros-apt-source/ in the upstream ros image.
@@ -40,15 +41,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pciutils \
     python3-pip \
     python3-colcon-common-extensions \
+    unzip \
     ros-humble-nav2-msgs \
     ros-humble-nav2-bringup \
     ros-humble-webots-ros2 \
     ros-humble-webots-ros2-driver \
     ros-humble-controller-manager \
+    ros-humble-diagnostic-updater \
     ros-humble-diff-drive-controller \
     ros-humble-joint-state-broadcaster \
     ros-humble-robot-state-publisher \
     ros-humble-tf2-ros \
+    ros-humble-rmw-zenoh-cpp \
     wget \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -58,11 +62,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Default URL uses ghfast.top mirror for reliable access; override with
 # --build-arg WEBOTS_DEB_URL=https://github.com/... for direct GitHub.
 ARG WEBOTS_DEB_URL=https://ghfast.top/https://github.com/cyberbotics/webots/releases/download/R2025a/webots_2025a_amd64.deb
-RUN wget -q -O /tmp/webots.deb "${WEBOTS_DEB_URL}" \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends /tmp/webots.deb \
-    && rm -f /tmp/webots.deb \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    wget -S --progress=dot:giga -O /tmp/webots.deb "${WEBOTS_DEB_URL}"; \
+    ls -lh /tmp/webots.deb; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends /tmp/webots.deb; \
+    rm -f /tmp/webots.deb; \
+    rm -rf /var/lib/apt/lists/*
 
 # The streaming-viewer's default WS URL is `ws://localhost:1234`, which
 # is wrong for any remote browser (they'd hit their own localhost).
@@ -72,7 +78,7 @@ RUN sed -i 's|</body>|<script>document.getElementById("IP-input").value="ws://"+
     /usr/local/webots/resources/web/streaming_viewer/index.html
 
 # Pre-populate Webots asset cache. Without this, Webots fetches ~100 files from
-# raw.githubusercontent.com at first run — often blocked or painfully slow.
+# raw.githubusercontent.com at first run, which is slow and less reproducible.
 # The seed tarball is exported from a successful run; see scripts/update-webots-seed.sh.
 COPY bridge/webots_assets_seed.tar.gz /tmp/webots_seed.tar.gz
 RUN mkdir -p /root/.cache/Cyberbotics/Webots \
@@ -87,6 +93,8 @@ RUN mkdir -p /root/.cache/Cyberbotics/Webots \
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN python3 -m pip install --no-cache-dir \
     "grpcio>=1.78.0" "protobuf>=6.30,<7" mcp "fastmcp>=3" numpy Pillow uvicorn httpx
+
+ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
 # Build context is sim/bridge/ — ros_ws lives one level up at sim/ros_ws/.
 # Compose passes context: ../ so we COPY from there.

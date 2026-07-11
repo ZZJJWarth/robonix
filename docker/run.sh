@@ -2,7 +2,12 @@
 set -e
 
 # set your workspace target here
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_TARGET=..
+# shellcheck disable=SC1091
+source "$REPO_ROOT/scripts/docker_base_image.sh"
+ROBONIX_ROS_DEV_BASE_IMAGE="${ROBONIX_ROS_DEV_BASE_IMAGE:-robonix-osrf-ros:humble-desktop}"
 
 if [ -f .env ]; then
     echo "[*] Loading environment variables from .env..."
@@ -14,7 +19,7 @@ USE_LOCAL=false
 REMOTE_IMAGE="docker.io/enkerewpo/robonix_ros:latest"
 LOCAL_IMAGE="robonix_ros"
 CONTAINER_NAME=robonix_ros_dev
-RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 ROBONIX_META_GRPC_ADDR="${ROBONIX_META_GRPC_ADDR:-0.0.0.0:50051}"
 ROBONIX_META_GRPC_ENDPOINT="${ROBONIX_META_GRPC_ENDPOINT:-127.0.0.1:50051}"
 
@@ -39,7 +44,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help     Show this help message"
             echo ""
             echo "Environment:"
-            echo "  RMW_IMPLEMENTATION      Default: rmw_fastrtps_cpp"
+            echo "  RMW_IMPLEMENTATION      Default: rmw_zenoh_cpp"
             echo "  ROBONIX_META_GRPC_ADDR  Default: 0.0.0.0:50051"
             echo "  ROBONIX_META_GRPC_ENDPOINT Default: 127.0.0.1:50051"
             echo ""
@@ -63,7 +68,8 @@ if [ "$USE_LOCAL" = true ]; then
     # Build local image if it doesn't exist
     if ! docker image inspect $IMAGE_NAME >/dev/null 2>&1; then
         echo "[*] Local image not found, building..."
-        docker build -t $IMAGE_NAME .
+        robonix_ensure_local_base_image "$ROBONIX_ROS_DEV_BASE_IMAGE" "osrf/ros:humble-desktop"
+        docker build --pull=false --build-arg "ROS_BASE_IMAGE=$ROBONIX_ROS_DEV_BASE_IMAGE" -t "$IMAGE_NAME" "$SCRIPT_DIR"
     else
         echo "[*] Local image found, skipping build"
     fi
@@ -78,7 +84,8 @@ else
         IMAGE_NAME=$LOCAL_IMAGE
         if ! docker image inspect $IMAGE_NAME >/dev/null 2>&1; then
             echo "[*] Building local image as fallback..."
-            docker build -t $IMAGE_NAME .
+            robonix_ensure_local_base_image "$ROBONIX_ROS_DEV_BASE_IMAGE" "osrf/ros:humble-desktop"
+            docker build --pull=false --build-arg "ROS_BASE_IMAGE=$ROBONIX_ROS_DEV_BASE_IMAGE" -t "$IMAGE_NAME" "$SCRIPT_DIR"
         fi
     }
 fi

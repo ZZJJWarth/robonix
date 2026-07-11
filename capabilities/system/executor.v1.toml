@@ -1,9 +1,0 @@
-
-[contract]
-id      = "robonix/system/executor"
-version = "1"
-kind    = "service"
-idl     = "executor/srv/Execute.srv"
-
-[mode]
-type = "rpc_server_stream"

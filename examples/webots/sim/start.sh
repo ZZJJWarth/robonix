@@ -11,6 +11,16 @@
 # Stop with Ctrl-C, or from another terminal: `docker compose -f compose.yaml down`.
 set -euo pipefail
 
+# Sim container / compose-project names — overridable via ROBONIX_SIM_CONTAINER
+# / ROBONIX_SIM_PROJECT so a CI / parallel deploy brings up its OWN isolated
+# Webots container instead of the shared default. Exported so the compose files
+# (`name:`, `container_name:`) interpolate the same values. Stream ports are
+# similarly offset via ROBONIX_SIM_STREAM_PORT / ROBONIX_SIM_VIEWER_PORT, and
+# GPU via ROBONIX_GPU_ID. Defaults preserve existing single-deploy behaviour.
+export ROBONIX_SIM_CONTAINER="${ROBONIX_SIM_CONTAINER:-robonix_tiago_sim}"
+export ROBONIX_SIM_PROJECT="${ROBONIX_SIM_PROJECT:-robonix_tiago_sim}"
+SIM_CT="$ROBONIX_SIM_CONTAINER"
+
 # Resolve the script's own directory ONCE in absolute form. We cd into
 # it below; afterwards `$(dirname "$0")` no longer points anywhere
 # usable (it's relative to the *original* CWD, which is gone). The
@@ -20,7 +30,47 @@ set -euo pipefail
 # even though the script printed "[sim/start] launching rviz2 ..."
 # because the bash sub-process couldn't find start_rviz.sh.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# Avoid Docker Hub metadata checks on every compose rebuild. The helper creates
+# a local alias and pulls through configured mirrors on first use.
+# Override ROBONIX_SIM_ROS_BASE_IMAGE for a custom/mirror/digest base.
+# shellcheck disable=SC1091
+source "$REPO_ROOT/scripts/docker_base_image.sh"
+export ROBONIX_SIM_ROS_BASE_IMAGE="${ROBONIX_SIM_ROS_BASE_IMAGE:-robonix-osrf-ros:humble-desktop-full}"
+robonix_ensure_local_base_image "$ROBONIX_SIM_ROS_BASE_IMAGE" "osrf/ros:humble-desktop-full"
 cd "$SCRIPT_DIR"
+
+# Webots world / robot launch args.
+# Usage:
+#   ./start.sh --world your_new_world.wbt
+#   ROBONIX_WEBOTS_WORLD=your_new_world.wbt ./start.sh
+export ROBONIX_WEBOTS_WORLD="${ROBONIX_WEBOTS_WORLD:-office.wbt}"
+export ROBONIX_WEBOTS_ROBOT="${ROBONIX_WEBOTS_ROBOT:-tiago_webots.urdf}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --world|-w)
+      export ROBONIX_WEBOTS_WORLD="$2"
+      shift 2
+      ;;
+    --robot|-r)
+      export ROBONIX_WEBOTS_ROBOT="$2"
+      shift 2
+      ;;
+    --help|-h)
+      echo "Usage: $0 [--world WORLD.wbt] [--robot ROBOT.urdf]"
+      exit 0
+      ;;
+    *)
+      echo "[sim/start] unknown argument: $1" >&2
+      echo "Usage: $0 [--world WORLD.wbt] [--robot ROBOT.urdf]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+echo "[sim/start] using Webots world: $ROBONIX_WEBOTS_WORLD"
+echo "[sim/start] using robot URDF: $ROBONIX_WEBOTS_ROBOT"
 
 # Auto-detect DISPLAY if the launching shell didn't export one. Probes
 # the standard local X server slots via `xset q`; if any responds, use
@@ -87,11 +137,24 @@ if [[ "${ROBONIX_SIM_STREAM:-0}" = "1" ]]; then
   echo "[sim/start] stream mode — merging compose.stream.yaml (WS :1234, viewer :8080)"
 fi
 
-# X11 GUI: ensure docker can reach the local DISPLAY. xhost is harmless
-# on systems without an X server (it just fails silently).
-if command -v xhost &>/dev/null; then
-  xhost +local:docker >/dev/null 2>&1 || true
-fi
+allow_x11_for_docker() {
+  if ! command -v xhost &>/dev/null; then
+    echo "[sim/start] warning: xhost not found; Docker may not be allowed to open DISPLAY=$DISPLAY"
+    return 0
+  fi
+
+  local ok=0
+  xhost +SI:localuser:root >/dev/null 2>&1 && ok=1 || true
+  xhost +local:root >/dev/null 2>&1 && ok=1 || true
+  xhost +local:docker >/dev/null 2>&1 && ok=1 || true
+  if [[ "$ok" != "1" ]]; then
+    echo "[sim/start] warning: failed to authorize Docker for DISPLAY=$DISPLAY"
+    echo "[sim/start] If Webots exits with Qt xcb / 'No protocol specified', run:"
+    echo "[sim/start]   xhost +SI:localuser:root +local:root"
+  fi
+}
+
+allow_x11_for_docker
 
 # Bring sim up detached so we can layer rviz on top before tailing logs.
 docker compose "${CF[@]}" up --build -d
@@ -101,7 +164,7 @@ docker compose "${CF[@]}" up --build -d
 # publishing /scanner /odom /head_front_camera/* etc."
 echo "[sim/start] waiting for sim ros topics..."
 for _ in $(seq 1 60); do
-    n=$(docker exec robonix_tiago_sim bash -c \
+    n=$(docker exec "$SIM_CT" bash -c \
         'source /opt/ros/humble/setup.bash 2>/dev/null && ros2 topic list 2>/dev/null | wc -l' 2>/dev/null || echo 0)
     if [[ "${n:-0}" -gt 20 ]]; then
         echo "[sim/start] ros up ($n topics)"
@@ -135,9 +198,7 @@ fi
 # into `docker exec`, independent of the container's internal Xorg :48.
 # So an xrdp / NoMachine user still gets rviz inside their session;
 # webots' 3D view streams to the browser via :8080 separately.
-if command -v xhost &>/dev/null; then
-    xhost +local:docker >/dev/null 2>&1 || true
-fi
+allow_x11_for_docker
 echo "[sim/start] launching rviz2 (config: rviz2_default.rviz)"
 # Per-user log path: /tmp is shared on multi-tenant boxes and a fixed
 # /tmp/rviz2.log file owned by another user blocks rewrite. ${USER:-rviz}

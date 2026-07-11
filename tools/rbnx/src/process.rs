@@ -4,14 +4,14 @@
 // Process management for robonix-cli (start/stop/monitor processes)
 
 use anyhow::{Context, Result};
-use dirs;
+use robonix_scribe::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 /// Information about a running process for a capability or skill
@@ -23,6 +23,10 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub log_file: PathBuf,
     pub hostname: String,
+    #[serde(default)]
+    pub package_path: Option<PathBuf>,
+    #[serde(default)]
+    pub command: String,
 }
 
 /// Process start result with group information
@@ -71,11 +75,35 @@ impl ProcessTreeNode {
     }
 }
 
+/// Resolve the per-deploy process-state path from the log directory.
+///
+/// Two layouts are recognised:
+///
+///   * `<…>/rbnx-boot/logs/`  →  `<…>/rbnx-boot/processes.json` (sits
+///     next to `rbnx-boot/state.json` written by `rbnx boot`/`shutdown`)
+///   * anything else          →  `<log_dir>/../processes.json`
+///     (covers `rbnx start --standalone` on a package whose default
+///     `rbnx-build/logs/` is the log root)
+///
+/// The result is always inside the per-deploy tree — never `~/.robonix/`,
+/// which is reserved for cross-deploy user state.
+fn derive_state_file_path(log_dir: &Path) -> PathBuf {
+    if let Some(parent) = log_dir.parent()
+        && parent.file_name().and_then(|s| s.to_str()) == Some("rbnx-boot")
+    {
+        return parent.join("processes.json");
+    }
+    match log_dir.parent() {
+        Some(p) => p.join("processes.json"),
+        None => log_dir.join("processes.json"),
+    }
+}
+
 /// Manager for processes running capabilities and skills
 pub struct ProcessManager {
     processes: Arc<Mutex<HashMap<String, ProcessInfo>>>, // key: "{package_type}::{std_name}"
-    /// Ensures the deploy log directory exists; reserved for future file logging.
-    _log_dir: PathBuf,
+    /// Per-package log directory for Scribe structured logs.
+    log_dir: PathBuf,
     state_file: PathBuf,
     hostname: String,
 }
@@ -92,17 +120,29 @@ impl ProcessManager {
             .to_string_lossy()
             .to_string();
 
-        // State file in ~/.robonix/processes.json
-        let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-        let state_dir = home_dir.join(".robonix");
-        std::fs::create_dir_all(&state_dir).with_context(|| {
-            format!("Failed to create state directory: {}", state_dir.display())
-        })?;
-        let state_file = state_dir.join("processes.json");
+        // State file lives in the per-deploy root, NOT ~/.robonix/.
+        //
+        // ~/.robonix/ is for cross-deploy user state (config.yaml, chat.yaml,
+        // voiceprint enrollments, installed package db). The package runtime
+        // record belongs to ONE deploy and dies with it, so it must live
+        // inside the deploy tree — the same place `rbnx shutdown` reads
+        // `<manifest-dir>/rbnx-boot/state.json` from — and disappear on
+        // shutdown. A `~/.robonix/processes.json` from a half-killed boot
+        // would otherwise leak across deploys and confuse `rbnx start` on
+        // unrelated packages.
+        //
+        // The deploy root is anchored to the log directory (which
+        // `rbnx start` defaults to `<pkg>/rbnx-build/logs`, and
+        // `rbnx boot` overrides to `<manifest-dir>/rbnx-boot/logs`).
+        // State file is the sibling `processes.json` in the same dir —
+        // or, when a deploy root is unambiguous (`<…>/rbnx-boot/logs`),
+        // inside the `rbnx-boot/` parent so it sits next to
+        // `rbnx-boot/state.json` and `rbnx-boot/logs/`.
+        let state_file = derive_state_file_path(&log_dir);
 
         let mut manager = Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
-            _log_dir: log_dir,
+            log_dir,
             state_file,
             hostname,
         };
@@ -122,23 +162,40 @@ impl ProcessManager {
         let content = std::fs::read_to_string(&self.state_file)
             .with_context(|| format!("Failed to read state file: {}", self.state_file.display()))?;
 
-        let processes: Vec<ProcessInfo> = serde_json::from_str(&content).with_context(|| {
-            format!("Failed to parse state file: {}", self.state_file.display())
-        })?;
+        if content.trim().is_empty() {
+            warn!(
+                "Process state file {} is empty; resetting stale runtime state",
+                self.state_file.display()
+            );
+            self.save_state_internal(&HashMap::new())?;
+            return Ok(());
+        }
+
+        let processes: Vec<ProcessInfo> = match serde_json::from_str(&content) {
+            Ok(processes) => processes,
+            Err(err) => {
+                warn!(
+                    "Process state file {} is invalid ({err}); resetting stale runtime state",
+                    self.state_file.display()
+                );
+                self.save_state_internal(&HashMap::new())?;
+                return Ok(());
+            }
+        };
 
         // Verify processes are still running and filter out dead ones
         let mut valid_processes = HashMap::new();
         let original_count = processes.len();
         for process_info in processes {
-            // Check if process is still running
-            if Self::is_process_running(process_info.pid) {
+            // Check if process is still live. `kill(pid, 0)` alone accepts
+            // zombies and PID reuse; validate procfs too when available.
+            if Self::is_process_record_live(&process_info) {
                 let key = format!("{}::{}", process_info.package_type, process_info.std_name);
                 valid_processes.insert(key, process_info);
             } else {
-                log::info!(
+                info!(
                     "Process {} (PID: {}) is no longer running, removing from state",
-                    process_info.std_name,
-                    process_info.pid
+                    process_info.std_name, process_info.pid
                 );
             }
         }
@@ -153,7 +210,70 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// Check if a process with given PID is still running
+    /// Check if a persisted process record still points at a live process.
+    fn is_process_record_live(process_info: &ProcessInfo) -> bool {
+        if !Self::is_process_running(process_info.pid) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            if Self::is_process_zombie(process_info.pid) {
+                return false;
+            }
+            let Some(cmdline) = Self::process_cmdline(process_info.pid) else {
+                return false;
+            };
+            if cmdline.trim().is_empty() || cmdline.contains("<defunct>") {
+                return false;
+            }
+            // Old state files did not store command/cwd, which made PID reuse
+            // indistinguishable from a real still-running package. Treat them
+            // as stale after this schema upgrade; new records below carry both.
+            if process_info.command.trim().is_empty() || !cmdline.contains(&process_info.command) {
+                return false;
+            }
+            let Some(expected_cwd) = process_info.package_path.as_ref() else {
+                return false;
+            };
+            if let Ok(actual_cwd) = std::fs::read_link(format!("/proc/{}/cwd", process_info.pid)) {
+                if actual_cwd != *expected_cwd {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    fn is_process_zombie(pid: u32) -> bool {
+        let path = format!("/proc/{pid}/status");
+        let Ok(status) = std::fs::read_to_string(path) else {
+            return true;
+        };
+        status
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .map(|line| line.contains(" Z") || line.contains(" X"))
+            .unwrap_or(true)
+    }
+
+    #[cfg(unix)]
+    fn process_cmdline(pid: u32) -> Option<String> {
+        let path = format!("/proc/{pid}/cmdline");
+        let raw = std::fs::read(path).ok()?;
+        Some(
+            String::from_utf8_lossy(&raw)
+                .replace('\0', " ")
+                .trim()
+                .to_string(),
+        )
+    }
+
+    /// Check if a process with given PID exists. This is only the first
+    /// liveness probe; callers that use persisted state should prefer
+    /// `is_process_record_live`.
     fn is_process_running(pid: u32) -> bool {
         #[cfg(unix)]
         {
@@ -199,7 +319,13 @@ impl ProcessManager {
         &self.hostname
     }
 
-    /// Start a process; blocks until it exits. Output goes to terminal (no log file for now).
+    /// Start a process; blocks until it exits.  Stdout / stderr are captured
+    /// line-by-line and written to Scribe structured logs under
+    /// `$SCRIBE_LOG_DIR/{tag}.log` (tag = `std_name`, e.g.
+    /// `"com.robonix.service.mapping"`).  Lines are NOT forwarded to the
+    /// terminal — `rbnx boot` owns the display and raw package output would
+    /// drown out the boot progress lines.  Use `rbnx logs -f` for live
+    /// per-package log tailing.
     pub async fn start_process(
         &self,
         _package_name: &str,
@@ -212,7 +338,7 @@ impl ProcessManager {
         {
             let processes = self.processes.lock().unwrap();
             if let Some(existing) = processes.get(&key) {
-                log::warn!("Process for {} already running, skipping", key);
+                warn!("Process for {} already running, skipping", key);
                 #[cfg(unix)]
                 let (pgid, pids) = {
                     if let Ok(pgid) = Self::get_process_group_id(existing.pid) {
@@ -248,9 +374,17 @@ impl ProcessManager {
         cmd.arg("-c").arg(start_script);
 
         cmd.current_dir(package_path)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .env("PYTHONUNBUFFERED", "1");
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("PYTHONUNBUFFERED", "1")
+            .env("SCRIBE_LOG_DIR", &self.log_dir);
+        #[cfg(unix)]
+        if std::env::var_os("RBNX_DEPLOY_MANAGED").is_none() {
+            // A standalone `rbnx start` owns a group for its package. When
+            // boot spawned this wrapper, preserve boot's PGID so one teardown
+            // reaches the wrapper and its actual package process together.
+            cmd.process_group(0);
+        }
 
         let mut child = cmd
             .spawn()
@@ -258,12 +392,71 @@ impl ProcessManager {
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("Failed to get process ID"))?;
-        log::info!("Running {} (PID {})", key, pid);
+        info!("Running {} (PID {})", key, pid);
+        let log_file = self.log_dir.join(format!("{std_name}.log"));
+        {
+            let mut processes = self.processes.lock().unwrap();
+            processes.insert(
+                key.clone(),
+                ProcessInfo {
+                    package_name: _package_name.to_string(),
+                    std_name: std_name.to_string(),
+                    package_type: package_type.to_string(),
+                    pid,
+                    log_file: log_file.clone(),
+                    hostname: self.hostname.clone(),
+                    package_path: Some(package_path.to_path_buf()),
+                    command: start_script.to_string(),
+                },
+            );
+        }
+        self.save_state()?;
+
+        // Pipe stdout / stderr through Scribe so structured logs land in
+        // $SCRIBE_LOG_DIR/{tag}.log.  Do NOT forward to the terminal —
+        // `rbnx boot` owns the display and raw package output would
+        // drown out the boot progress lines.
+        let stdout = child.stdout.take().expect("stdout not piped");
+        let stderr = child.stderr.take().expect("stderr not piped");
+        // Scribe tag + log-file stem = `std_name` (the provider_id) verbatim,
+        // matching `deploy::log_path`. No name mangling.
+        let tag = std_name.to_string();
+
+        let stdout_task = tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                robonix_scribe::ingest(&tag, &line);
+            }
+        });
+
+        let tag2 = std_name.to_string();
+        let stderr_task = tokio::spawn(async move {
+            let reader = tokio::io::BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Many programs (Python in particular) write INFO and
+                // WARNING messages to stderr — use `info` rather than
+                // `warn` so the level in the file doesn't misrepresent
+                // the actual severity.
+                robonix_scribe::ingest(&tag2, &line);
+            }
+        });
 
         let status = child
             .wait()
             .await
             .with_context(|| "Failed to wait for process")?;
+
+        // Drain remaining pipe output before returning.
+        let _ = tokio::join!(stdout_task, stderr_task);
+
+        {
+            let mut processes = self.processes.lock().unwrap();
+            processes.remove(&key);
+        }
+        self.save_state()?;
+
         if !status.success() {
             anyhow::bail!("{}: process exited with {}", std_name, status);
         }
@@ -300,7 +493,7 @@ impl ProcessManager {
 
         if let Some(process_info) = process_info {
             // Verify the process is actually still running
-            if Self::is_process_running(process_info.pid) {
+            if Self::is_process_record_live(&process_info) {
                 return true;
             } else {
                 // Process is dead, remove it from state
@@ -332,7 +525,7 @@ impl ProcessManager {
                 let pgid_obj = Pid::from_raw(gid as i32);
                 // List all processes in the group before killing
                 if let Ok(pids) = Self::get_processes_in_group(gid) {
-                    log::info!(
+                    info!(
                         "Stopping process group {} (root PID: {}): found {} processes: {:?}",
                         gid,
                         pid,
@@ -340,24 +533,24 @@ impl ProcessManager {
                         pids
                     );
                 } else {
-                    log::info!("Stopping process group {} (root PID: {})", gid, pid);
+                    info!("Stopping process group {} (root PID: {})", gid, pid);
                 }
                 pgid_obj
             }
             Err(_) => {
                 // Fallback: assume PGID equals PID (true if we used setsid)
-                log::warn!(
+                warn!(
                     "Could not get process group ID for PID {}, assuming PGID=PID",
                     pid
                 );
-                log::info!("Stopping process (PID: {}, assumed PGID: {})", pid, pid);
+                info!("Stopping process (PID: {}, assumed PGID: {})", pid, pid);
                 pid_obj
             }
         };
 
         // First, send SIGTERM to the entire process group
         if let Err(e) = killpg(pgid, Signal::SIGTERM) {
-            log::warn!("Failed to send SIGTERM to process group {}: {:?}", pgid, e);
+            warn!("Failed to send SIGTERM to process group {}: {:?}", pgid, e);
             // Fallback: try killing the process directly
             let _ = kill(pid_obj, Signal::SIGTERM);
         }
@@ -400,7 +593,7 @@ impl ProcessManager {
                 }
 
                 if !still_alive.is_empty() {
-                    log::info!(
+                    info!(
                         "Process group still has {} processes alive, sending SIGKILL",
                         still_alive.len()
                     );
@@ -602,7 +795,7 @@ impl ProcessManager {
         };
 
         if let Some(process_info) = process_info {
-            log::info!("Stopping process: {} (PID: {})", key, process_info.pid);
+            info!("Stopping process: {} (PID: {})", key, process_info.pid);
 
             // Get process group information before killing
             #[cfg(unix)]
@@ -619,10 +812,9 @@ impl ProcessManager {
 
             // Kill the process tree (parent + all children)
             if let Err(e) = self.kill_process_tree(process_info.pid) {
-                log::warn!(
+                warn!(
                     "Failed to kill process tree for PID {}: {:?}",
-                    process_info.pid,
-                    e
+                    process_info.pid, e
                 );
                 // Fallback: try to kill just the main process
                 #[cfg(unix)]
@@ -659,7 +851,7 @@ impl ProcessManager {
                 let _ = file.write_all(stop_msg.as_bytes()).await;
             }
 
-            log::info!("Process stopped: {}", key);
+            info!("Process stopped: {}", key);
 
             // Save state to persistent storage (lock is already dropped, so this is safe)
             self.save_state()?;
@@ -670,7 +862,7 @@ impl ProcessManager {
                 pids,
             })
         } else {
-            log::warn!("Process not found: {}", key);
+            warn!("Process not found: {}", key);
             anyhow::bail!("Process not found: {}", key)
         }
     }
@@ -720,3 +912,49 @@ impl ProcessManager {
 // Processes are started as daemon processes and should continue running
 // even after the CLI exits. They can be stopped explicitly using the
 // unregister command or stop_process/stop_all methods.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "robonix-process-test-{label}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn empty_process_state_is_reset_instead_of_fatal() {
+        let root = unique_temp_dir("empty");
+        let log_dir = root.join("rbnx-boot").join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let state_file = root.join("rbnx-boot").join("processes.json");
+        fs::write(&state_file, "").unwrap();
+
+        let manager = ProcessManager::new(log_dir).unwrap();
+
+        assert!(manager.processes.lock().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), "[]");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_process_state_is_reset_instead_of_fatal() {
+        let root = unique_temp_dir("invalid");
+        let log_dir = root.join("rbnx-boot").join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let state_file = root.join("rbnx-boot").join("processes.json");
+        fs::write(&state_file, "{").unwrap();
+
+        let manager = ProcessManager::new(log_dir).unwrap();
+
+        assert!(manager.processes.lock().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), "[]");
+        let _ = fs::remove_dir_all(root);
+    }
+}

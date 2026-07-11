@@ -18,13 +18,110 @@
 // in favour of "capability"; "runtime" is "system".
 
 use anyhow::{Context, Result};
+use robonix_scribe::warn;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Preferred per-package manifest filename. Legacy `robonix_manifest.yaml`
 /// is also accepted by [`detect_manifest_path`].
 pub const MANIFEST_FILE: &str = "package_manifest.yaml";
 pub const LEGACY_MANIFEST_FILE: &str = "robonix_manifest.yaml";
+
+/// Cache directory name for a URL-backed deploy package.
+///
+/// The name comes from the repository, not the configured provider id: one
+/// repository can supply more than one configured instance.
+pub fn deploy_repo_dir_name(url: &str) -> String {
+    url.trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("pkg")
+        .to_string()
+}
+
+/// Apply deployment `env:` and expand `$VAR` / `${VAR}` in every scalar.
+///
+/// `rbnx` and Soma call this same entry point before parsing a deployment so
+/// they cannot disagree about paths, selected manifests, or package config.
+pub fn prepare_deployment_manifest(
+    mut root: serde_yaml::Value,
+    robonix_source_path: Option<&Path>,
+) -> Result<serde_yaml::Value> {
+    if std::env::var_os("ROBONIX_SOURCE_PATH").is_none()
+        && let Some(path) = robonix_source_path
+    {
+        // This runs before package child processes start.
+        unsafe { std::env::set_var("ROBONIX_SOURCE_PATH", path) };
+    }
+    let env: HashMap<String, String> = root
+        .get("env")
+        .cloned()
+        .map(serde_yaml::from_value)
+        .transpose()
+        .context("parse top-level env")?
+        .unwrap_or_default();
+    let expanded: Vec<(&String, String)> = env
+        .iter()
+        .map(|(key, value)| (key, expand_deployment_env(value)))
+        .collect();
+    for (key, value) in expanded {
+        unsafe { std::env::set_var(key, value) };
+    }
+    expand_deployment_yaml(&mut root);
+    Ok(root)
+}
+
+pub fn expand_deployment_env(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'{' {
+                if let Some(end) = s[i + 2..].find('}') {
+                    out.push_str(&std::env::var(&s[i + 2..i + 2 + end]).unwrap_or_default());
+                    i = i + 2 + end + 1;
+                    continue;
+                }
+            } else if bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                out.push_str(&std::env::var(&s[start..end]).unwrap_or_default());
+                i = end;
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().expect("non-empty by loop guard");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn expand_deployment_yaml(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::String(s) => *s = expand_deployment_env(s),
+        serde_yaml::Value::Sequence(sequence) => {
+            for item in sequence {
+                expand_deployment_yaml(item);
+            }
+        }
+        serde_yaml::Value::Mapping(mapping) => {
+            for (_, item) in mapping.iter_mut() {
+                expand_deployment_yaml(item);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DetectedManifest {
@@ -46,6 +143,7 @@ pub struct Manifest {
     pub package: Package,
     pub build: String,
     pub start: String,
+    pub stop: String,
     pub capabilities: Vec<CapabilityRef>,
     pub depends: Vec<DependsRef>,
     /// True iff the manifest was parsed from legacy fields (id/nodes/build.script).
@@ -63,10 +161,14 @@ pub struct Package {
     pub id: Option<String>,
     #[serde(default)]
     pub version: String,
-    #[serde(default)]
-    pub vendor: String,
+    /// Deprecated package metadata accepted for old manifests. New package
+    /// manifests should use maintainers/tags for catalog metadata.
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub maintainers: Vec<String>,
     #[serde(default)]
     pub license: String,
 }
@@ -117,6 +219,9 @@ struct RawManifest {
     /// New: top-level shell string.
     #[serde(default)]
     start: Option<String>,
+    /// Optional package-owned cleanup command, symmetric with `start`.
+    #[serde(default)]
+    stop: Option<String>,
     /// Legacy: list of nodes, each with its own `start` block.
     #[serde(default)]
     nodes: Vec<LegacyNode>,
@@ -151,7 +256,29 @@ struct LegacyNode {
     start: String,
 }
 
-pub fn detect_manifest_path(package_root: &Path) -> Result<PathBuf> {
+/// Locate a package's manifest file inside `package_root`.
+///
+/// `override_name` lets a deploy entry select a non-default manifest file
+/// (the `manifest:` field on a deploy `PackageEntry`) so one package can
+/// ship per-deployment-target variants — e.g. `package_manifest.yaml`
+/// (x86 + docker), `package_manifest.jetson-native.yaml`, and
+/// `package_manifest.jetson-docker.yaml`, each with its own build/start —
+/// without changing the manifest schema itself. When set, the named file
+/// MUST exist (a typo'd target should fail loud, not silently fall back to
+/// the default manifest and build the wrong thing). When `None`, the
+/// default `package_manifest.yaml` (then legacy) is used as before.
+pub fn detect_manifest_path(package_root: &Path, override_name: Option<&str>) -> Result<PathBuf> {
+    if let Some(name) = override_name {
+        let p = package_root.join(name);
+        if p.is_file() {
+            return Ok(p);
+        }
+        anyhow::bail!(
+            "manifest override `{name}` not found in {} — the deploy entry's \
+             `manifest:` field names a file the package does not ship",
+            package_root.display()
+        );
+    }
     let new_path = package_root.join(MANIFEST_FILE);
     if new_path.exists() {
         return Ok(new_path);
@@ -163,8 +290,11 @@ pub fn detect_manifest_path(package_root: &Path) -> Result<PathBuf> {
     anyhow::bail!("Package does not have {MANIFEST_FILE} (or legacy {LEGACY_MANIFEST_FILE})")
 }
 
-pub fn detect_and_load(package_root: &Path) -> Result<DetectedManifest> {
-    let path = detect_manifest_path(package_root)?;
+pub fn detect_and_load(
+    package_root: &Path,
+    override_name: Option<&str>,
+) -> Result<DetectedManifest> {
+    let path = detect_manifest_path(package_root, override_name)?;
     let manifest = load_from_path(&path)?;
     Ok(DetectedManifest { path, manifest })
 }
@@ -229,6 +359,8 @@ fn normalize(raw: RawManifest, manifest_path: &Path) -> Manifest {
         (None, true) => String::new(),
     };
 
+    let stop = raw.stop.unwrap_or_default();
+
     if filename_is_legacy {
         is_legacy = true;
     }
@@ -238,6 +370,7 @@ fn normalize(raw: RawManifest, manifest_path: &Path) -> Manifest {
         package,
         build,
         start,
+        stop,
         capabilities: raw.capabilities,
         depends: raw.depends,
         is_legacy,
@@ -253,7 +386,6 @@ impl Manifest {
         for (name, val) in [
             ("package.name", &p.name),
             ("package.version", &p.version),
-            ("package.vendor", &p.vendor),
             ("package.description", &p.description),
             ("package.license", &p.license),
         ] {
@@ -273,7 +405,7 @@ impl Manifest {
         }
 
         if self.is_legacy {
-            log::warn!(
+            warn!(
                 "package '{}' uses legacy manifest fields (package.id / nodes[] / \
                  build.script / robonix_manifest.yaml). These still work but are \
                  deprecated — migrate to the new spec (package_manifest.yaml with \

@@ -21,10 +21,12 @@
 // robonix/service/speech/tts, robonix/service/voiceprint/identify) discovered
 // and called via gRPC — same pattern as the VLM service in Pilot.
 
+mod access;
 mod pb;
 mod voice;
 
-use anyhow::{Context, Result};
+use access::{AccessControlConfig, AccessDecision};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use pb::contracts::{
     robonix_system_liaison_submit_server::{
@@ -36,9 +38,11 @@ use pb::contracts::{
     robonix_system_pilot_client::RobonixSystemPilotClient,
 };
 use pb::liaison::{StartVoiceSessionRequest, VoiceEvent};
+use pb::pilot::rtdl_node_state::RtdlNodeStateEnum;
 use pb::pilot::{CapabilityCall, PilotEvent, Plan, Task};
 use robonix_atlas::client::{self as atlas_client, AtlasClient};
 use robonix_atlas::pb as atlas_pb;
+use robonix_scribe::{debug, info, warn};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,13 +80,22 @@ const EVT_FINAL_TEXT: u32 = 4;
 pub struct LiaisonPipeline {
     pilot_endpoint_default: String,
     atlas: Arc<Mutex<AtlasClient>>,
+    access: Arc<AccessControlConfig>,
 }
 
 impl LiaisonPipeline {
-    pub fn new(pilot_endpoint_default: impl Into<String>, atlas: Arc<Mutex<AtlasClient>>) -> Self {
+    /// Create a Liaison pipeline with a shared access-control policy. Every
+    /// text/API task is normalized first, then authorized before any Pilot
+    /// channel is opened.
+    pub fn new(
+        pilot_endpoint_default: impl Into<String>,
+        atlas: Arc<Mutex<AtlasClient>>,
+        access: Arc<AccessControlConfig>,
+    ) -> Self {
         Self {
             pilot_endpoint_default: pilot_endpoint_default.into(),
             atlas,
+            access,
         }
     }
 
@@ -92,6 +105,23 @@ impl LiaisonPipeline {
         mut task: Task,
     ) -> Result<mpsc::Receiver<Result<PilotEvent, Status>>> {
         ensure_user_id(&mut task);
+        let user_id = task_user_id(&task);
+        match self.access.authorize_user(&user_id) {
+            AccessDecision::Allow {
+                user_id,
+                method,
+                reason,
+                ..
+            } => {
+                info!("[liaison/access] text allow user={user_id} via {method:?}: {reason}");
+            }
+            AccessDecision::Deny {
+                user_id, reason, ..
+            } => {
+                warn!("[liaison/access] text deny user={user_id}: {reason}");
+                return Err(anyhow!("access denied for user '{user_id}': {reason}"));
+            }
+        }
         let (tx, rx) = mpsc::channel(64);
 
         let pilot_ep = match resolve_pilot_endpoint(&self.atlas).await {
@@ -189,12 +219,24 @@ fn ensure_user_id(task: &mut Task) {
     task.context_json = ctx.to_string();
 }
 
+fn task_user_id(task: &Task) -> String {
+    serde_json::from_str::<serde_json::Value>(&task.context_json)
+        .ok()
+        .and_then(|ctx| {
+            ctx.get("user_id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+}
+
 // ── SystemLiaison gRPC impl ─────────────────────────────────────────────────
 
 struct LiaisonServiceImpl {
     pipeline: Arc<LiaisonPipeline>,
     atlas: Arc<Mutex<AtlasClient>>,
     pilot_endpoint_default: String,
+    access: Arc<AccessControlConfig>,
 }
 
 #[tonic::async_trait]
@@ -229,6 +271,7 @@ impl RobonixSystemLiaisonVoice for LiaisonServiceImpl {
             req,
             Arc::clone(&self.atlas),
             self.pilot_endpoint_default.clone(),
+            Arc::clone(&self.access),
         )
         .await?;
         let boxed: Self::StartVoiceSessionStream = Box::pin(stream);
@@ -253,7 +296,7 @@ async fn drain_session_end(pipeline: &LiaisonPipeline, session_id: &str) {
             let mut stream = ReceiverStream::new(rx);
             while stream.next().await.is_some() {}
         }
-        Err(e) => log::debug!("[liaison/text] session_end: {e:#}"),
+        Err(e) => debug!("[liaison/text] session_end: {e:#}"),
     }
 }
 
@@ -338,7 +381,11 @@ async fn run_text_loop(pipeline: Arc<LiaisonPipeline>) -> Result<()> {
                         }
                         EVT_BATCH_RESULT => {
                             if let Some(ref r) = ev.batch_result {
-                                let ok = r.results.iter().filter(|x| x.success).count();
+                                let ok = r
+                                    .results
+                                    .iter()
+                                    .filter(|x| x.state == RtdlNodeStateEnum::Succeeded as u32)
+                                    .count();
                                 println!(
                                     "[round {}] results: {ok} ok, {} failed",
                                     r.round,
@@ -381,20 +428,27 @@ struct Args {
     #[arg(long = "pilot-endpoint")]
     pilot_endpoint: Option<String>,
 
-    /// Log filter (env_logger format). Defaults to $RUST_LOG, then "robonix_liaison=info".
+    /// Log level for this component (`debug`/`info`/`warn`/`error`). Sets the
+    /// scribe log-file floor; falls back to `SCRIBE_FILE_LEVEL` / `info`.
+    /// Normally arrives inside `--config-json`, not as a standalone flag.
     #[arg(long)]
     log: Option<String>,
+
+    /// The component's `system.liaison` manifest block, serialized to JSON by
+    /// rbnx and passed as one arg (`--config-json '{...}'`). Parsed by the binary
+    /// itself; `robonix_scribe::init_from_config` reads the `log` key from it so
+    /// the manifest's per-component level reaches the log.
+    #[arg(long = "config-json")]
+    config_json: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let log_filter = args
-        .log
-        .clone()
-        .or_else(|| std::env::var("RUST_LOG").ok())
-        .unwrap_or_else(|| "robonix_liaison=info".to_string());
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_filter)).init();
+    // Apply the manifest's per-component `log:` level (delivered inside
+    // --config-json) to scribe's file sink before the first log line.
+    robonix_scribe::init_from_config("liaison", args.config_json.as_deref());
+    info!("robonix-liaison starting");
 
     let atlas_endpoint = args.atlas.clone().unwrap_or_else(|| {
         env_first(
@@ -440,7 +494,7 @@ async fn main() -> Result<()> {
     let listen_port = listen_addr.port();
     let advertised = format!("127.0.0.1:{listen_port}");
 
-    log::info!("connecting to atlas at {atlas_http}");
+    info!("connecting to atlas at {atlas_http}");
     let mut atlas = AtlasClient::connect_with_retry(&atlas_http, 10, Duration::from_secs(2))
         .await
         .context("connect to atlas")?;
@@ -489,10 +543,10 @@ async fn main() -> Result<()> {
         )
         .await
     {
-        log::warn!("SetLifecycleState(ACTIVE) on {LIAISON_PROVIDER_ID} failed: {e:#}");
+        warn!("SetLifecycleState(ACTIVE) on {LIAISON_PROVIDER_ID} failed: {e:#}");
     }
-    log::info!("registered as '{LIAISON_PROVIDER_ID}', SystemLiaison gRPC on :{listen_port}");
-    eprintln!("robonix-liaison ready on :{listen_port}  (pilot_default={pilot_http})");
+    info!("registered as '{LIAISON_PROVIDER_ID}', SystemLiaison gRPC on :{listen_port}");
+    info!("robonix-liaison ready on :{listen_port}  (pilot_default={pilot_http})");
 
     {
         let mut hb = atlas.clone();
@@ -502,18 +556,29 @@ async fn main() -> Result<()> {
             loop {
                 tick.tick().await;
                 if let Err(e) = hb.heartbeat(LIAISON_PROVIDER_ID).await {
-                    log::warn!("heartbeat failed: {e:#}");
+                    warn!("heartbeat failed: {e:#}");
                 }
             }
         });
     }
 
     let atlas = Arc::new(Mutex::new(atlas));
-    let pipeline = Arc::new(LiaisonPipeline::new(pilot_http.clone(), Arc::clone(&atlas)));
+    let access = Arc::new(AccessControlConfig::from_env());
+    info!(
+        "access gate enabled={} allowed_users={} voice_threshold={:.2}",
+        access.enabled,
+        access.allowed_users.len(),
+        access.voice_threshold
+    );
+    let pipeline = Arc::new(LiaisonPipeline::new(
+        pilot_http.clone(),
+        Arc::clone(&atlas),
+        Arc::clone(&access),
+    ));
 
     let source = std::env::var("ROBONIX_LIAISON_SOURCE").unwrap_or_default();
     let text_handle: Option<tokio::task::JoinHandle<Result<()>>> = if source == "text" {
-        log::info!("activating stdin text loop (headless mode)");
+        info!("activating stdin text loop (headless mode)");
         Some(tokio::spawn(run_text_loop(Arc::clone(&pipeline))))
     } else {
         None
@@ -523,6 +588,7 @@ async fn main() -> Result<()> {
         pipeline,
         atlas: Arc::clone(&atlas),
         pilot_endpoint_default: pilot_http,
+        access,
     });
     let server = tonic::transport::Server::builder()
         .add_service(RobonixSystemLiaisonSubmitServer::from_arc(Arc::clone(&svc)))
@@ -604,5 +670,19 @@ mod tests {
         assert_eq!(v["modality"], "audio");
         assert_eq!(v["user_id"], "voice:alice");
         assert_eq!(v["foo"], "bar");
+    }
+
+    #[test]
+    fn task_user_id_reads_context_field() {
+        let t = Task {
+            task_id: "t".into(),
+            session_id: "s".into(),
+            source: 0,
+            text: "hi".into(),
+            audio_data: vec![],
+            context_json: r#"{"user_id":"local:alice"}"#.into(),
+            timestamp_ms: 0,
+        };
+        assert_eq!(task_user_id(&t), "local:alice");
     }
 }

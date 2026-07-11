@@ -31,7 +31,64 @@ source /opt/ros/humble/setup.bash
 source /colcon_ws/install/setup.bash
 set -u
 
-NVIDIA_DISPLAY=:48
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+
+# Display number is overridable via ROBONIX_SIM_XDISPLAY so two sim containers
+# can run on one host without colliding on the same Xorg socket / logfile (a CI
+# runner alongside an interactive user). Default :48 preserves single-tenant
+# behaviour. XNUM is the bare number used for the /tmp/.X11-unix/X<n> socket.
+NVIDIA_DISPLAY="${ROBONIX_SIM_XDISPLAY:-:48}"
+XNUM="${NVIDIA_DISPLAY#:}"
+ZENOH_ROUTER_PID=""
+_webots_launch_pid=""
+
+cleanup() {
+  if [ -n "${_webots_launch_pid:-}" ]; then
+    kill -TERM "${_webots_launch_pid}" 2>/dev/null || true
+  fi
+  if [ -n "${ZENOH_ROUTER_PID:-}" ]; then
+    kill -TERM "${ZENOH_ROUTER_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+start_zenoh_router() {
+  if [ "${RMW_IMPLEMENTATION:-}" != "rmw_zenoh_cpp" ]; then
+    return 0
+  fi
+  local router_bin="/opt/ros/humble/lib/rmw_zenoh_cpp/rmw_zenohd"
+  if [ ! -x "$router_bin" ]; then
+    echo "[entrypoint] rmw_zenohd not found at $router_bin"
+    return 1
+  fi
+  export ZENOH_ROUTER_CHECK_ATTEMPTS="${ZENOH_ROUTER_CHECK_ATTEMPTS:-20}"
+  "$router_bin" >/tmp/rmw_zenohd.log 2>&1 &
+  ZENOH_ROUTER_PID=$!
+  echo "[entrypoint] rmw_zenohd pid=${ZENOH_ROUTER_PID}"
+  local i
+  for i in $(seq 1 20); do
+    if ! kill -0 "$ZENOH_ROUTER_PID" 2>/dev/null; then
+      echo "[entrypoint] rmw_zenohd exited early; last 80 lines:"
+      tail -80 /tmp/rmw_zenohd.log 2>&1 || true
+      return 1
+    fi
+    if python3 - <<PY >/dev/null 2>&1
+import socket
+with socket.create_connection(("127.0.0.1", 7447), timeout=0.2):
+    pass
+PY
+    then
+      echo "[entrypoint] rmw_zenohd listening on tcp/127.0.0.1:7447"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[entrypoint] rmw_zenohd did not listen on :7447; last 80 lines:"
+  tail -80 /tmp/rmw_zenohd.log 2>&1 || true
+  return 1
+}
 
 start_nvidia_xorg() {
   # Pick the GPU with the most free memory and translate its PCI BusID
@@ -78,21 +135,22 @@ EndSection
 XCONF
 
   Xorg "$NVIDIA_DISPLAY" -config /tmp/xorg-nvidia.conf \
-       -noreset -nolisten tcp -logfile /tmp/Xorg.48.log &
+       -noreset -novtswitch -sharevts -nolisten tcp \
+       -logfile "/tmp/Xorg.${XNUM}.log" &
   local i
   for i in $(seq 1 30); do
-    [ -S /tmp/.X11-unix/X48 ] && break
+    [ -S "/tmp/.X11-unix/X${XNUM}" ] && break
     sleep 0.5
   done
-  if ! [ -S /tmp/.X11-unix/X48 ]; then
-    echo "[entrypoint] Xorg :48 failed; last 40 lines of /tmp/Xorg.48.log:"
-    tail -40 /tmp/Xorg.48.log 2>&1 || true
+  if ! [ -S "/tmp/.X11-unix/X${XNUM}" ]; then
+    echo "[entrypoint] Xorg ${NVIDIA_DISPLAY} failed; last 40 lines of /tmp/Xorg.${XNUM}.log:"
+    tail -40 "/tmp/Xorg.${XNUM}.log" 2>&1 || true
     return 1
   fi
   export DISPLAY=$NVIDIA_DISPLAY
   local renderer
   renderer=$(glxinfo -B 2>/dev/null | awk -F'string: ' '/OpenGL renderer/ {print $2; exit}')
-  echo "[entrypoint] Xorg :48 up, renderer=$renderer"
+  echo "[entrypoint] Xorg ${NVIDIA_DISPLAY} up, renderer=$renderer"
   if ! echo "$renderer" | grep -qi nvidia; then
     echo "[entrypoint] WARN: renderer is not NVIDIA — webots will still be slow"
     return 1
@@ -101,10 +159,46 @@ XCONF
 }
 
 start_xvfb() {
-  Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -nolisten unix &
-  export DISPLAY=:99
+  Xvfb "$NVIDIA_DISPLAY" -screen 0 1920x1080x24 -nolisten tcp &
+  export DISPLAY="$NVIDIA_DISPLAY"
   sleep 1
-  echo "[entrypoint] Xvfb :99 (CPU render)"
+  echo "[entrypoint] Xvfb ${NVIDIA_DISPLAY} (CPU render)"
+}
+
+prepare_full_webots_assets() {
+  if [ "${ROBONIX_WEBOTS_DOWNLOAD_ALL_ASSETS:-0}" != "1" ]; then
+    return 0
+  fi
+
+  local version url mirror fetch_url cache_dir marker tmp_zip
+  version="${ROBONIX_WEBOTS_ASSETS_VERSION:-R2025a}"
+  url="${ROBONIX_WEBOTS_ASSETS_URL:-https://github.com/cyberbotics/webots/releases/download/${version}/assets-${version}.zip}"
+  mirror="${ROBONIX_WEBOTS_ASSETS_MIRROR:-https://ghfast.top/}"
+  fetch_url="$url"
+  if [ -n "$mirror" ]; then
+    case "$url" in
+      https://github.com/*)
+        fetch_url="${mirror%/}/${url}"
+        ;;
+    esac
+  fi
+
+  cache_dir="${ROBONIX_WEBOTS_ASSET_CACHE_DIR:-/root/.cache/Cyberbotics/Webots/assets}"
+  marker="${cache_dir}/.robonix-full-assets-${version}.ok"
+  if [ -f "$marker" ]; then
+    echo "[entrypoint] Webots full asset cache already present (${version})"
+    return 0
+  fi
+
+  mkdir -p "$cache_dir"
+  tmp_zip="/tmp/webots-assets-${version}.zip"
+  echo "[entrypoint] downloading Webots full asset library: ${fetch_url}"
+  wget -S --progress=dot:giga -O "$tmp_zip" "$fetch_url"
+  echo "[entrypoint] extracting Webots full asset library to ${cache_dir}"
+  unzip -q -o "$tmp_zip" -d "$cache_dir"
+  rm -f "$tmp_zip"
+  touch "$marker"
+  echo "[entrypoint] Webots full asset library ready: $(find "$cache_dir" -maxdepth 1 -type f | wc -l) cached files"
 }
 
 case "${WEBOTS_HEADLESS_MODE:-host}" in
@@ -132,8 +226,22 @@ if [ "${WEBOTS_STREAM:-0}" = "1" ]; then
   echo "[entrypoint] viewer HTTP on :8080  ws on :1234"
 fi
 
+start_zenoh_router
+prepare_full_webots_assets
+
 WEBOTS_WARMUP_SEC="${WEBOTS_WARMUP_SEC:-25}"
-ros2 launch eaios_webots robot_launch.py use_sim_time:=true &
+
+ROBONIX_WEBOTS_WORLD="${ROBONIX_WEBOTS_WORLD:-office.wbt}"
+ROBONIX_WEBOTS_ROBOT="${ROBONIX_WEBOTS_ROBOT:-tiago_webots.urdf}"
+
+echo "[entrypoint] Webots world: ${ROBONIX_WEBOTS_WORLD}"
+echo "[entrypoint] robot URDF: ${ROBONIX_WEBOTS_ROBOT}"
+
+ros2 launch eaios_webots robot_launch.py \
+  use_sim_time:=true \
+  world:="${ROBONIX_WEBOTS_WORLD}" \
+  robot:="${ROBONIX_WEBOTS_ROBOT}" &
+
 _webots_launch_pid=$!
 echo "[entrypoint] eaios_webots pid=${_webots_launch_pid}"
 sleep "${WEBOTS_WARMUP_SEC}"

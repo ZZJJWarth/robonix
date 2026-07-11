@@ -13,7 +13,7 @@
 // capability-card-style fields) waits until the TOML schema grows.
 
 use anyhow::Context;
-use log::{info, warn};
+use robonix_scribe::{info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -255,10 +255,9 @@ fn io_types_from_parsed(parsed: &RawContract) -> (String, String) {
 fn parse_idl_path(s: &str) -> Option<(&str, &'static str, &str)> {
     let (stem, kind): (&str, &'static str) = if let Some(rest) = s.strip_suffix(".srv") {
         (rest, "srv")
-    } else if let Some(rest) = s.strip_suffix(".msg") {
-        (rest, "msg")
     } else {
-        return None;
+        let rest = s.strip_suffix(".msg")?;
+        (rest, "msg")
     };
     let parts: Vec<&str> = stem.split('/').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() {

@@ -137,10 +137,19 @@ fn resolve_package_path_for_start(config: &Config, spec: &str) -> Result<PathBuf
 
 pub async fn execute_build(
     config: Config,
+    file: Option<PathBuf>,
     path: Option<PathBuf>,
     global: Option<String>,
     clean: bool,
 ) -> Result<()> {
+    if let Some(file) = file {
+        let manifest_path = resolve_local_path_for_filesystem(&file)?;
+        if !manifest_path.is_file() {
+            anyhow::bail!("deployment manifest not found: {}", manifest_path.display());
+        }
+        return build_deploy_manifest(&manifest_path, &config, clean);
+    }
+
     // Deploy-manifest mode: if `path` (or cwd, when -p is omitted)
     // contains a `robonix_manifest.yaml`, build every primitive /
     // service / skill entry it lists. This lets the user run
@@ -185,12 +194,16 @@ fn build_deploy_manifest(manifest_path: &Path, config: &Config, clean: bool) -> 
         .with_context(|| format!("read {}", manifest_path.display()))?;
     let root: Value =
         serde_yaml::from_str(&raw).with_context(|| format!("parse {}", manifest_path.display()))?;
+    let root = super::deploy::prepare_manifest(root, config.robonix_source_path.as_deref())
+        .with_context(|| format!("prepare {}", manifest_path.display()))?;
     let cache_root = manifest_dir.join("rbnx-boot").join("cache");
 
     output::action(
         "Building",
         &format!("packages declared in {}", manifest_path.display()),
     );
+    // Notice (non-fatal) if any cloned remote provider is behind upstream.
+    super::check_remotes::report_outdated(manifest_path);
 
     // Collect (section, name, pkg_dir, url_to_clone) for every entry.
     struct Resolved {
@@ -198,6 +211,10 @@ fn build_deploy_manifest(manifest_path: &Path, config: &Config, clean: bool) -> 
         name: String,
         pkg_dir: PathBuf,
         url_to_clone: Option<(String, Option<String>)>, // (url, branch)
+        // Deploy `manifest:` override — selects a per-target package
+        // manifest variant (e.g. package_manifest.jetson-native.yaml) so
+        // the right build path runs. None = default package_manifest.yaml.
+        manifest_override: Option<String>,
     }
     let mut entries: Vec<Resolved> = Vec::new();
     for section in &["primitive", "service", "skill"] {
@@ -216,18 +233,26 @@ fn build_deploy_manifest(manifest_path: &Path, config: &Config, clean: bool) -> 
                 .get("branch")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let manifest_override = entry
+                .get("manifest")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             match (local_path, url) {
                 (Some(p), _) => entries.push(Resolved {
                     section,
                     name,
                     pkg_dir: manifest_dir.join(p),
                     url_to_clone: None,
+                    manifest_override,
                 }),
                 (None, Some(u)) => entries.push(Resolved {
                     section,
                     name: name.clone(),
-                    pkg_dir: cache_root.join(&name),
+                    // Cache dir = git repo name (one clone per repo), not the
+                    // per-instance provider id. See deploy::repo_dir_name.
+                    pkg_dir: cache_root.join(super::deploy::repo_dir_name(u)),
                     url_to_clone: Some((u.to_string(), branch)),
+                    manifest_override,
                 }),
                 (None, None) => {
                     output::warning(&format!(
@@ -240,9 +265,9 @@ fn build_deploy_manifest(manifest_path: &Path, config: &Config, clean: bool) -> 
     // `system:` non-builtin entries are real packages too (memory / scene
     // / speech / …), they just live under `<robonix_source>/system/<key>/`
     // instead of being declared with an explicit `path:` / `url:`. The
-    // builtin Rust binaries (atlas / executor / pilot / liaison) are
+    // builtin Rust binaries (atlas / executor / pilot / liaison / soma) are
     // shipped via `cargo install` and skipped here.
-    const SYSTEM_BUILTINS: &[&str] = &["atlas", "executor", "pilot", "liaison"];
+    const SYSTEM_BUILTINS: &[&str] = &["atlas", "executor", "pilot", "liaison", "soma"];
     if let Some(map) = root.get("system").and_then(|v| v.as_mapping()) {
         let source_root = config.robonix_source_path.as_ref();
         for (key, _value) in map {
@@ -272,6 +297,7 @@ fn build_deploy_manifest(manifest_path: &Path, config: &Config, clean: bool) -> 
                 name: key_str.to_string(),
                 pkg_dir,
                 url_to_clone: None,
+                manifest_override: None,
             });
         }
     }
@@ -358,7 +384,7 @@ fn build_deploy_manifest(manifest_path: &Path, config: &Config, clean: bool) -> 
         output::step(r.section, &r.name);
         let (pkg_name, version) = read_pkg_meta(&canon);
         let location = rel_to(&manifest_dir, &canon);
-        match build::build_local_package(&canon, clean) {
+        match build::build_local_package(&canon, clean, r.manifest_override.as_deref()) {
             Ok(()) => built.push(Row {
                 section: r.section,
                 name: r.name.clone(),
@@ -532,12 +558,13 @@ pub async fn execute_start(
     registry_endpoint: Option<&str>,
     config_file: Option<&Path>,
     set_overrides: &[String],
+    manifest_override: Option<&str>,
 ) -> Result<()> {
     let package_root = match spec {
         Some(s) => resolve_package_path_for_start(config, s)?,
         None => find_package_from_cwd()?,
     };
-    let detected = manifest::detect_and_load(&package_root)?;
+    let detected = manifest::detect_and_load(&package_root, manifest_override)?;
     let manifest = &detected.manifest;
     manifest.validate_and_summarize()?;
 
@@ -554,12 +581,13 @@ pub async fn execute_start(
     let materialized_cfg_json = build_start_config_json(config_file, set_overrides)?;
 
     // Per-package run logs live under <pkg>/rbnx-build/logs (gitignored,
-    // owned by the package itself). Earlier code put them in the parent
-    // dir's rbnx-boot/logs, which created stray empty `rbnx-boot/`
-    // directories sibling to the package whenever `rbnx start` ran from
-    // outside.
-    let log_dir = package_root.join("rbnx-build").join("logs");
-    let process_manager = ProcessManager::new(log_dir)?;
+    // owned by the package itself).  When `rbnx boot` spawns us, it sets
+    // $SCRIBE_LOG_DIR to the deploy log dir — respect that so boot-time
+    // logs stay under `rbnx-boot/logs/` for `rbnx logs` to find.
+    let log_dir = std::env::var("SCRIBE_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| package_root.join("rbnx-build").join("logs"));
+    let process_manager = ProcessManager::new(log_dir.clone())?;
 
     output::action("Running", &manifest.package.name);
     output::sub_step(&format!("Atlas endpoint: {}", endpoint));
@@ -577,6 +605,7 @@ pub async fn execute_start(
 
     let mut env = std::collections::HashMap::new();
     env.insert("ROBONIX_ATLAS".to_string(), endpoint.clone());
+    env.insert("SCRIBE_LOG_DIR".to_string(), log_dir.display().to_string());
     if materialized_cfg_json.is_some() {
         output::sub_step("Config: will deliver via Driver(CMD_INIT) post-register");
     }
@@ -595,7 +624,7 @@ pub async fn execute_start(
 
     if !manifest.build.trim().is_empty() && !build::build_stamp_path(&package_root).exists() {
         output::sub_step("No rbnx-build/.rbnx-built — running package build first");
-        build::build_local_package(&package_root, false)?;
+        build::build_local_package(&package_root, false, manifest_override)?;
     }
 
     let exports = env
@@ -603,6 +632,7 @@ pub async fn execute_start(
         .map(|(k, v)| format!("export {}={}", k, shell_escape(v)))
         .collect::<Vec<_>>()
         .join("; ");
+    let pythonpath_export = generated_pythonpath_export(&package_root);
     let start_body = manifest.start.trim();
     let setup_bash = package_root
         .join("rbnx-build")
@@ -614,7 +644,7 @@ pub async fn execute_start(
     } else {
         String::new()
     };
-    let prefix_parts: Vec<String> = [setup_source, exports]
+    let prefix_parts: Vec<String> = [setup_source, exports, pythonpath_export]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect();
@@ -649,10 +679,18 @@ pub async fn execute_start(
         None
     };
 
+    // Scribe tag = the per-INSTANCE provider id, never the package name. A
+    // single package (one `package.name`) can be deployed as N instances, each
+    // with a distinct provider id; tagging by package.name would collide them
+    // all into one log. `rbnx boot` passes the instance's provider id via
+    // RBNX_INSTANCE_NAME (the deploy manifest entry's `name`); fall back to
+    // package.name only for a bare standalone `rbnx start` with no instance.
+    let instance_name =
+        std::env::var("RBNX_INSTANCE_NAME").unwrap_or_else(|_| manifest.package.name.clone());
     let result = process_manager
         .start_process(
-            &manifest.package.name,
-            &manifest.package.name,
+            &instance_name,
+            &instance_name,
             "package",
             &package_root,
             &start_command,
@@ -671,9 +709,45 @@ pub async fn execute_start(
     Ok(())
 }
 
+/// Build the package-local Python import path without touching a colcon
+/// workspace. A real `rbnx-build/ws/install/setup.bash`, when present, is
+/// sourced first; this export then prepends generated stubs while preserving
+/// every Python path contributed by that overlay and the parent environment.
+fn generated_pythonpath_export(package_root: &Path) -> String {
+    let codegen_root = package_root.join("rbnx-build").join("codegen");
+    let mut paths = vec![package_root.to_path_buf()];
+    for path in [
+        codegen_root.join("proto_gen"),
+        codegen_root.join("robonix_mcp_types"),
+    ] {
+        if path.is_dir() {
+            paths.push(path);
+        }
+    }
+    let joined = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "export PYTHONPATH={}:${{PYTHONPATH:-}}",
+        shell_escape(&joined)
+    )
+}
+
 const CMD_INIT_DELIVERY: u32 = 0;
+const DEFAULT_DRIVER_INIT_TIMEOUT: Duration = Duration::from_secs(90);
 const CAP_REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn driver_init_timeout() -> Duration {
+    std::env::var("ROBONIX_DRIVER_INIT_TIMEOUT_S")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_DRIVER_INIT_TIMEOUT)
+}
 
 /// Wait for the new provider (any provider not in `before`) to appear in atlas with a
 /// `*/driver` gRPC capability, then call Driver(CMD_INIT, config_json). One
@@ -774,6 +848,7 @@ async fn call_driver_init(
         format!("http://{endpoint}")
     };
     let result = async {
+        let driver_timeout = driver_init_timeout();
         let channel = Endpoint::new(normalized.clone())
             .with_context(|| format!("invalid driver endpoint '{normalized}'"))?
             .connect()
@@ -788,7 +863,7 @@ async fn call_driver_init(
         grpc.ready().await.context("gRPC ready")?;
         let codec: tonic_prost::ProstCodec<DriverRequest, DriverResponse> = Default::default();
         let resp = tokio::time::timeout(
-            Duration::from_secs(90),
+            driver_timeout,
             grpc.unary(
                 Request::new(DriverRequest {
                     command: CMD_INIT_DELIVERY,
@@ -799,7 +874,12 @@ async fn call_driver_init(
             ),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Driver(CMD_INIT) timed out after 90s"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Driver(CMD_INIT) timed out after {}s",
+                driver_timeout.as_secs()
+            )
+        })?
         .context("Driver(CMD_INIT) RPC failed")?;
         Ok::<_, anyhow::Error>(resp.into_inner())
     }
@@ -907,4 +987,37 @@ fn merge_dotted(root: &mut serde_json::Value, key: &str, v: serde_json::Value) -
         .ok_or_else(|| anyhow::anyhow!("--set {key}: parent is not an object"))?
         .insert(last.to_string(), v);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rbnx-start-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn generated_pythonpath_is_injected_without_a_setup_stub() {
+        let root = temp_root("pythonpath");
+        let proto = root.join("rbnx-build/codegen/proto_gen");
+        let mcp = root.join("rbnx-build/codegen/robonix_mcp_types");
+        fs::create_dir_all(&proto).unwrap();
+        fs::create_dir_all(&mcp).unwrap();
+
+        let export = generated_pythonpath_export(&root);
+
+        assert!(export.contains(&root.display().to_string()));
+        assert!(export.contains(&proto.display().to_string()));
+        assert!(export.contains(&mcp.display().to_string()));
+        assert!(export.ends_with(":${PYTHONPATH:-}"));
+        assert!(!root.join("rbnx-build/ws/install/setup.bash").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }
