@@ -169,12 +169,12 @@ impl Drop for ObservationWorker {
 
 /// Validate the public envelope before sampling or admitting bounded work.
 pub(super) fn validate(request: &ObserveDeviceTimestampRequest) -> Result<(), Status> {
-    for value in [&request.domain_id, &request.session_id] {
-        if value.is_empty() || value.len() > 128 || value.trim() != value {
-            return Err(Status::invalid_argument(
-                "domain_id and session_id must contain 1..128 bytes without surrounding whitespace",
-            ));
-        }
+    crate::model::validate_domain_id(&request.domain_id).map_err(Status::invalid_argument)?;
+    let session = &request.session_id;
+    if session.is_empty() || session.len() > 128 || session.trim() != session {
+        return Err(Status::invalid_argument(
+            "session_id must contain 1..128 bytes without surrounding whitespace",
+        ));
     }
     if request.device_generation == 0 || request.device_timestamp_ns < 0 {
         return Err(Status::invalid_argument(

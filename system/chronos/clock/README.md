@@ -36,6 +36,10 @@ verification, and generation changes; Linux system time remains unverified.
 Read failures return errors without logging or fabricating timestamps. Steady
 values are local to the host and cannot be compared across machines.
 
+Step detection adds both readings' sampling uncertainty to `max_clock_step_ns`,
+so scheduling delays within the measured brackets do not reset clock generations.
+Realtime moving backward still starts a new generation.
+
 The shared `ChronosConfigError` retains the existing configuration error
 variants for compatibility with `robonix-chronos`; domain validation and YAML
 configuration parsing remain in that package. `robonix-chronos` re-exports the

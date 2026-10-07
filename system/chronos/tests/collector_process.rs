@@ -121,6 +121,7 @@ struct Scenario {
     bad_startup: bool,
     late: bool,
     query: bool,
+    query_mode: Option<&'static str>,
     ros_disabled: bool,
     total_disabled: bool,
     missing_ros: bool,
@@ -183,6 +184,21 @@ async fn hardware_query_failure_does_not_fall_back_to_ros() {
 }
 
 #[tokio::test]
+/// Oversized startup and unterminated observation output fail promptly and reap the helper.
+async fn oversized_query_output_reaps_the_helper() {
+    for mode in ["oversized_startup", "oversized_observation"] {
+        exercise(Scenario {
+            query: true,
+            query_mode: Some(mode),
+            bad_startup: true,
+            ros_disabled: true,
+            ..Default::default()
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 /// Fatal helper failure cancels other domains still waiting for discovery.
 async fn hardware_helper_failure_cancels_pending_ros_discovery() {
     exercise(Scenario {
@@ -229,11 +245,14 @@ async fn exercise(scenario: Scenario) {
         bad_startup,
         late,
         query,
+        query_mode,
         ros_disabled,
         total_disabled,
         missing_ros,
         late_ros,
     } = scenario;
+    let helper_files = tempfile::tempdir().unwrap();
+    let helper_pid_file = helper_files.path().join("helper.pid");
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
@@ -314,7 +333,13 @@ async fn exercise(scenario: Scenario) {
         };
         let observation = &mut config["core"]["domains"]["camera"]["strategy"]["observation"];
         observation["reference_at"] = "host_query_midpoint".into();
-        observation["query"] = serde_json::json!({"adapter": "query_fixture:create", "tick_ns": 1000, "options": {"mode": if bad_startup { "error" } else { "normal" }}});
+        observation["query"] = serde_json::json!({"adapter": "query_fixture:create", "tick_ns": 1000, "options": {
+            "mode": query_mode.unwrap_or(if bad_startup { "error" } else { "normal" }),
+        }});
+        if query_mode.is_some() {
+            observation["query"]["options"]["pid_file"] =
+                helper_pid_file.to_string_lossy().into_owned().into();
+        }
         config["core"]["domains"]["camera"]["timestamp"]["wrap_period_ns"] =
             (4_294_967_296_000_u64).into();
     }
@@ -355,6 +380,13 @@ async fn exercise(scenario: Scenario) {
         })
         .await
         .unwrap();
+        if query_mode.is_some() {
+            let pid = std::fs::read_to_string(&helper_pid_file).unwrap();
+            assert!(
+                !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+                "failed helper must be reaped"
+            );
+        }
         assert_eq!(collector_edges(&registry).await, 0);
         server.abort();
         return;

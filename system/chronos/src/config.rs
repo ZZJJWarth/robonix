@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub use robonix_chronos_clock::{ChronosConfigError, ReferenceConfig, ReferenceSourceKind};
 use serde::Deserialize;
 
-use crate::model::{ClockDomainDescriptor, ClockDomainPolicy};
+use crate::model::{ClockDomainDescriptor, ClockDomainPolicy, validate_domain_id};
 
 /// Transports used to discover a query's driver or a ROS timestamp stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -291,9 +291,7 @@ fn validate_domain(
         domain_id: domain_id.to_string(),
         reason: reason.to_string(),
     };
-    if domain_id.trim().is_empty() {
-        return Err(invalid("domain_id must not be empty"));
-    }
+    validate_domain_id(domain_id).map_err(invalid)?;
     let query = matches!(&domain.strategy, DomainStrategyConfig::AffineModel { observation, .. }
         if observation.query.is_some());
     if domain.capabilities.is_empty() && !query {
@@ -607,6 +605,26 @@ chronos:
         assert_eq!(registrations[0].0.domain_id, "lidar_uptime_clock");
         assert_eq!(registrations[0].0.resolution_ns, 1_000);
         assert_eq!(registrations[0].1.minimum_observations, 8);
+    }
+
+    #[test]
+    /// Unsupported domain IDs fail at configuration loading, before collection starts.
+    fn rejects_domain_ids_that_cannot_be_observed() {
+        for original in ["front_camera_clock", "lidar_uptime_clock"] {
+            for id in [
+                String::new(),
+                " camera ".into(),
+                "x".repeat(129),
+                "界".repeat(43),
+            ] {
+                let yaml = DOMAIN_CONFIG.replace(&format!("{original}:"), &format!("'{id}':"));
+                let error = ChronosConfig::from_yaml(&yaml).unwrap_err();
+                assert!(error.to_string().contains("1..128 bytes"));
+            }
+            let yaml =
+                DOMAIN_CONFIG.replace(&format!("{original}:"), &format!("'{}':", "x".repeat(128)));
+            ChronosConfig::from_yaml(&yaml).unwrap();
+        }
     }
 
     #[test]

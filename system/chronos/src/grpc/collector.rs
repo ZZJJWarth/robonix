@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use robonix_atlas::{client::AtlasClient, pb as atlas_pb};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -19,6 +19,44 @@ use super::pb::chronos::ObserveDeviceTimestampRequest;
 use crate::{
     CapabilityTransportKind, ChronosConfig, DomainConfig, DomainStrategyConfig, QualityRuntime,
 };
+
+const IPC_LINE_LIMIT: usize = 4096;
+
+/// Bound helper lines while reading, including unterminated output; preserve UTF-8 framing.
+async fn read_ipc_line(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<String>> {
+    let mut line = Vec::with_capacity(IPC_LINE_LIMIT + 1);
+    let count = (&mut *reader)
+        .take((IPC_LINE_LIMIT + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if count == 0 {
+        return Ok(None);
+    }
+    // A full-size CRLF frame needs one more delimiter byte, never more payload.
+    if count == IPC_LINE_LIMIT + 1 && line.last() == Some(&b'\r') {
+        let delimiter = reader
+            .read_u8()
+            .await
+            .context("collector output exceeded IPC size limit")?;
+        ensure!(
+            delimiter == b'\n',
+            "collector output exceeded IPC size limit"
+        );
+        line.pop();
+    } else if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
+    ensure!(
+        line.len() <= IPC_LINE_LIMIT,
+        "collector output exceeded IPC size limit"
+    );
+    Ok(Some(
+        String::from_utf8(line).context("collector output is not UTF-8")?,
+    ))
+}
 
 pub(super) struct Collector {
     stop: watch::Sender<bool>,
@@ -296,13 +334,12 @@ impl Subscription {
                 .spawn()
                 .context("start Chronos collector (python3 with configured adapters or rclpy)")?;
             let mut stdin = child.stdin.take().context("collector stdin")?;
-            let mut stdout =
-                BufReader::new(child.stdout.take().context("collector stdout")?).lines();
+            let mut stdout = BufReader::new(child.stdout.take().context("collector stdout")?);
             let startup = async {
                 stdin
                     .write_all(format!("{}\n", serde_json::to_string(&[plan])?).as_bytes())
                     .await?;
-                let ready = tokio::time::timeout(Duration::from_secs(5), stdout.next_line())
+                let ready = tokio::time::timeout(Duration::from_secs(5), read_ipc_line(&mut stdout))
                     .await
                     .context("Chronos collector subscription startup timed out")??;
                 ensure!(
@@ -337,11 +374,7 @@ impl Subscription {
                 let _scripts = scripts;
                 let (sender, cancelled) = observations;
                 let forwarding = async {
-                    while let Some(line) = stdout.next_line().await? {
-                        ensure!(
-                            line.len() <= 4096,
-                            "collector observation exceeded IPC size limit"
-                        );
+                    while let Some(line) = read_ipc_line(&mut stdout).await? {
                         let input: Input =
                             serde_json::from_str(&line).context("decode collector observation")?;
                         let result = forward(&runtime, &sender, &cancelled, input).await;
@@ -695,6 +728,39 @@ async fn disconnect(atlas: &mut AtlasClient, channels: &[String]) -> Result<()> 
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    /// Legal handshake and boundary-size payloads remain separate despite fragmented reads.
+    async fn ipc_lines_preserve_framing_at_the_limit() {
+        let payload = "x".repeat(IPC_LINE_LIMIT);
+        let bytes = format!("{{\"ready\": true}}\r\n{payload}\n{payload}\r\nlast").into_bytes();
+        let mut reader = BufReader::with_capacity(7, std::io::Cursor::new(bytes));
+        assert_eq!(
+            read_ipc_line(&mut reader).await.unwrap().unwrap(),
+            "{\"ready\": true}"
+        );
+        assert_eq!(read_ipc_line(&mut reader).await.unwrap().unwrap(), payload);
+        assert_eq!(read_ipc_line(&mut reader).await.unwrap().unwrap(), payload);
+        assert_eq!(read_ipc_line(&mut reader).await.unwrap().unwrap(), "last");
+        assert!(read_ipc_line(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    /// Oversized output is rejected without waiting for a delimiter or helper exit.
+    async fn ipc_rejects_unterminated_output_before_eof() {
+        let (mut output, input) = tokio::io::duplex(IPC_LINE_LIMIT * 2);
+        output
+            .write_all(&vec![b'x'; IPC_LINE_LIMIT + 1])
+            .await
+            .unwrap();
+        let mut reader = BufReader::with_capacity(7, input);
+        let error = tokio::time::timeout(Duration::from_secs(1), read_ipc_line(&mut reader))
+            .await
+            .expect("oversized output must fail while the helper still holds stdout open")
+            .unwrap_err();
+        assert!(error.to_string().contains("IPC size limit"));
+        drop(output);
+    }
 
     #[tokio::test]
     /// The real bounded worker fits helper receive pairs, refuses stale input and honors cancellation.

@@ -23,6 +23,8 @@ use crate::{Chronos, ChronosConfig, ChronosSection, QualityRuntime};
 
 type SnapshotStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+const LIFECYCLE_CAPACITY: usize = 8;
+
 /// Lifecycle serialization and runtime ownership are shared by all three RPCs.
 #[derive(Clone)]
 pub(super) struct ChronosService {
@@ -33,6 +35,7 @@ pub(super) struct ChronosService {
     models: ModelsSender,
     shutdown: watch::Sender<bool>,
     observation_slots: Arc<Semaphore>,
+    lifecycle_slots: Arc<Semaphore>,
 }
 
 struct State {
@@ -67,6 +70,7 @@ impl ChronosService {
             models,
             shutdown,
             observation_slots: Arc::new(Semaphore::new(64)),
+            lifecycle_slots: Arc::new(Semaphore::new(LIFECYCLE_CAPACITY)),
         }
     }
 
@@ -149,10 +153,14 @@ impl ChronosService {
         }
     }
 
-    /// Apply existing Driver commands while preserving core identity on reactivation.
+    /// Admit bounded Driver work; owned transactions survive caller cancellation.
     pub async fn transition(&self, request: DriverRequest) -> Result<&'static str> {
+        let permit = self.lifecycle_slots.clone().try_acquire_owned().context(
+            "Chronos lifecycle request limit reached; retry after pending work completes",
+        )?;
         let service = self.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let result = service.transition_owned(request).await;
             if let Err(error) = &result {
                 robonix_scribe::error!("Chronos lifecycle transition failed: {error:#}");
@@ -636,8 +644,8 @@ mod tests {
     }
 
     #[tokio::test]
-    /// Caller cancellation does not cancel an owned initialization or lose worker cleanup.
-    async fn cancelled_driver_call_finishes_its_transaction() {
+    /// Cancelled callers retain bounded admission until their transactions finish, then release it.
+    async fn cancelled_driver_calls_remain_bounded_and_finish() {
         let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reserved.local_addr().unwrap();
         drop(reserved);
@@ -659,26 +667,57 @@ mod tests {
             "cancel-test".into(),
         );
         let locked = svc.state.lock().await;
-        let clone = svc.clone();
-        let caller = tokio::spawn(async move {
-            clone
-                .transition(DriverRequest {
+        let mut callers = Vec::new();
+        for _ in 0..LIFECYCLE_CAPACITY {
+            let clone = svc.clone();
+            callers.push(tokio::spawn(async move {
+                clone
+                    .transition(DriverRequest {
+                        command: 0,
+                        config_json: "{}".into(),
+                    })
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while svc.lifecycle_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for caller in callers {
+            caller.abort();
+            let _ = caller.await;
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            contracts::robonix_lifecycle_driver_server::RobonixLifecycleDriver::driver(
+                &svc,
+                Request::new(DriverRequest {
                     command: 0,
                     config_json: "{}".into(),
-                })
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        caller.abort();
-        let _ = caller.await;
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .into_inner();
+        assert!(!response.ok);
+        assert!(response.error.contains("lifecycle request limit reached"));
         drop(locked);
         tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if svc.state.lock().await.runtime.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+            while svc.lifecycle_slots.available_permits() != LIFECYCLE_CAPACITY {
+                tokio::task::yield_now().await;
             }
+        })
+        .await
+        .unwrap();
+        assert!(svc.state.lock().await.runtime.is_some());
+        svc.transition(DriverRequest {
+            command: 0,
+            config_json: "{}".into(),
         })
         .await
         .unwrap();

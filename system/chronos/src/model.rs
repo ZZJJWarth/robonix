@@ -5,6 +5,14 @@ use thiserror::Error;
 
 pub(crate) const PARTS_PER_BILLION: i128 = 1_000_000_000;
 
+/// Keep configured and observed domain identities within the same wire limits.
+pub(crate) fn validate_domain_id(domain_id: &str) -> Result<(), &'static str> {
+    if domain_id.is_empty() || domain_id.len() > 128 || domain_id.trim() != domain_id {
+        return Err("domain_id must contain 1..128 bytes without surrounding whitespace");
+    }
+    Ok(())
+}
+
 /// Synchronization state of one device clock domain.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +36,8 @@ pub struct ClockDomainDescriptor {
 impl ClockDomainDescriptor {
     /// Reject identities and units that cannot produce an unambiguous model.
     pub fn validate(&self) -> Result<(), ChronosError> {
-        if self.domain_id.trim().is_empty() {
-            return Err(ChronosError::InvalidDomain(
-                "domain_id must not be empty".to_string(),
-            ));
-        }
+        validate_domain_id(&self.domain_id)
+            .map_err(|reason| ChronosError::InvalidDomain(reason.into()))?;
         if self.resolution_ns == 0 {
             return Err(ChronosError::InvalidDomain(
                 "resolution_ns must be positive".to_string(),

@@ -82,7 +82,7 @@ impl<R: ClockReader> ReferenceObserver<R> {
         let resolution = self.reader.realtime_resolution_ns()?;
         let uncertainty_ns = bracket_uncertainty.saturating_add(resolution);
         let generation_changed =
-            self.reference_changed(reference_timestamp_ns, steady_received_ns)?;
+            self.reference_changed(reference_timestamp_ns, steady_received_ns, uncertainty_ns)?;
         if generation_changed {
             self.generation = self
                 .generation
@@ -137,11 +137,12 @@ impl<R: ClockReader> ReferenceObserver<R> {
         })
     }
 
-    /// Detect backward time or a forward/backward step relative to monotonic elapsed time.
+    /// Detect backward time or steps beyond the threshold and both sampling uncertainties.
     fn reference_changed(
         &self,
         reference_timestamp_ns: i64,
         steady_received_ns: u64,
+        uncertainty_ns: u64,
     ) -> Result<bool, ReferenceError> {
         let Some(previous) = self.last_sample.as_ref() else {
             return Ok(false);
@@ -152,8 +153,10 @@ impl<R: ClockReader> ReferenceObserver<R> {
         let reference_delta =
             i128::from(reference_timestamp_ns) - i128::from(previous.reference_timestamp_ns);
         let deviation = (reference_delta - i128::from(steady_delta)).abs();
-        Ok(reference_timestamp_ns < previous.reference_timestamp_ns
-            || deviation > i128::from(self.config.max_clock_step_ns))
+        let step_limit = i128::from(self.config.max_clock_step_ns)
+            + i128::from(previous.uncertainty_ns)
+            + i128::from(uncertainty_ns);
+        Ok(reference_timestamp_ns < previous.reference_timestamp_ns || deviation > step_limit)
     }
 }
 
@@ -340,18 +343,58 @@ mod tests {
     }
 
     #[test]
+    /// A scheduling stall in either bracket does not reset a constant-offset clock.
+    fn sampling_stalls_preserve_reference_generation() {
+        for (monotonic, realtime) in [
+            ([0, 0, 100, 300], [1_000, 1_100]),
+            ([0, 200, 300, 300], [1_000, 1_300]),
+        ] {
+            let reader = FakeClockReader {
+                monotonic: VecDeque::from(monotonic),
+                realtime: VecDeque::from(realtime),
+                resolution_ns: 1,
+            };
+            let mut observer = ReferenceObserver::new(config(), reader);
+            observer.sample().unwrap();
+            let current = observer.sample().unwrap();
+            assert_eq!(current.generation, 1);
+            assert!(!current.generation_changed);
+        }
+    }
+
+    #[test]
+    /// Sampling uncertainty does not hide steps beyond the combined error bound.
+    fn clock_steps_exceeding_bracket_uncertainty_change_generation() {
+        for second_reference in [1_400, 1_001] {
+            let reader = FakeClockReader {
+                monotonic: VecDeque::from([0, 0, 100, 300]),
+                realtime: VecDeque::from([1_000, second_reference]),
+                resolution_ns: 1,
+            };
+            let mut observer = ReferenceObserver::new(config(), reader);
+            observer.sample().unwrap();
+            assert!(observer.sample().unwrap().generation_changed);
+        }
+    }
+
+    #[test]
     /// Realtime moving backward always starts a new reference generation.
     fn backward_clock_changes_reference_generation() {
-        let reader = FakeClockReader {
-            monotonic: VecDeque::from([100, 100, 200, 200]),
-            realtime: VecDeque::from([1_000, 900]),
-            resolution_ns: 1,
-        };
-        let mut observer = ReferenceObserver::new(config(), reader);
-        observer.sample().unwrap();
-        let stepped = observer.sample().unwrap();
-        assert_eq!(stepped.generation, 2);
-        assert!(stepped.generation_changed);
+        for (monotonic, realtime) in [
+            ([100, 100, 200, 200], [1_000, 900]),
+            ([0, 0, 1, 2_001], [1_000, 999]),
+        ] {
+            let reader = FakeClockReader {
+                monotonic: VecDeque::from(monotonic),
+                realtime: VecDeque::from(realtime),
+                resolution_ns: 1,
+            };
+            let mut observer = ReferenceObserver::new(config(), reader);
+            observer.sample().unwrap();
+            let stepped = observer.sample().unwrap();
+            assert_eq!(stepped.generation, 2);
+            assert!(stepped.generation_changed);
+        }
     }
 
     #[test]

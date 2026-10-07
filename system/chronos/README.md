@@ -67,6 +67,13 @@ after INIT requires restarting the process. Configured device domains without
 observations report initialization and no model. The executable accepts explicit
 gRPC observations. Optional automatic ROS collection is described below.
 
+At most eight Driver transactions can be outstanding, including work whose
+caller has disconnected. Excess requests return `ok=false` with a retry message;
+admitted transactions finish before releasing their slot. Domain IDs contain
+1..128 UTF-8 bytes without surrounding whitespace; invalid IDs fail configuration
+loading before collection starts. Helper stdout payloads are limited to 4096 bytes
+while reading, including startup output. Oversized output stops and reaps the helper.
+
 ### Collect device observations
 
 `chronos.collect_observations` is the automatic collection master switch and
