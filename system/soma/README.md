@@ -15,6 +15,12 @@ publishing the ROS runtime-state fallback.
 
 ## Config
 
+Soma uses the in-process Chronos clock for snapshot publication timestamps.
+Runtime sample freshness uses local steady time from receipt in Soma, excluding
+the reader-to-Soma delivery delay. Source timestamp fields retain their existing
+semantics. Clock errors fail publication without replacing the cached snapshot;
+the runtime publisher reports the failure and retries at its next interval.
+
 Soma v2 uses a flat, four-key schema. Every field is required.
 
 ```yaml

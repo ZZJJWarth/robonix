@@ -13,6 +13,10 @@ Unsupported platforms, poisoned reference ownership, and read failures return
 errors without substituting a timestamp. Quality metadata remains separate
 from read errors: callers decide whether an unavailable reading is usable.
 
+`reference_timestamp_ns()` returns an available, nonnegative epoch timestamp
+for wire fields. It rejects read failures, unavailable quality and negative
+values. Unverified Linux reference time remains usable.
+
 Add `robonix-chronos-clock.workspace = true` to a workspace member's
 dependencies and construct a `VirtualClock` with an explicit `ReferenceConfig`:
 

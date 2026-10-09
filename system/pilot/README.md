@@ -4,6 +4,11 @@
 
 ## Build
 
+Transcript timestamps use the in-process Chronos reference clock. Clock errors
+propagate to the turn caller; queued records remain available for retry.
+File write failures keep their existing retry behavior. No running Chronos
+service is required.
+
 From the repo root:
 
 ```sh

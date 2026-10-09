@@ -17,7 +17,7 @@ use crate::runtime_state::RuntimeStateStore;
 use crate::store::{SomaBody, StoreError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -59,32 +59,37 @@ impl SomaService {
     }
 
     /// Publish the ROS-derived fallback unless a health primitive lease is active.
-    pub async fn publish_runtime_snapshot(&self) {
-        let mut snapshot = self.to_health_snapshot(0).await;
+    pub async fn publish_runtime_snapshot(&self) -> anyhow::Result<()> {
+        let mut snapshot = self.to_health_snapshot(0).await?;
         let mut state = self.snapshot_state.write().await;
         if state
             .primitive_valid_until
             .is_some_and(|deadline| deadline > Instant::now())
         {
-            return;
+            return Ok(());
         }
         snapshot.seq = self.next_sequence();
         state.latest = Some(snapshot.clone());
         state.primitive_valid_until = None;
         drop(state);
         let _ = self.snapshot_tx.send(snapshot);
+        Ok(())
     }
 
     /// Publish a health-primitive snapshot and suppress fallback until its TTL expires.
-    pub async fn publish_primitive_snapshot(&self, mut snapshot: SomaHealthSnapshot) {
+    pub async fn publish_primitive_snapshot(
+        &self,
+        mut snapshot: SomaHealthSnapshot,
+    ) -> anyhow::Result<()> {
         let ttl = Duration::from_millis(u64::from(snapshot.ttl_ms.max(1)));
+        snapshot.soma_ts_ns = unix_time_ns()?;
         snapshot.seq = self.next_sequence();
-        snapshot.soma_ts_ns = unix_time_ns();
         let mut state = self.snapshot_state.write().await;
         state.latest = Some(snapshot.clone());
         state.primitive_valid_until = Some(Instant::now() + ttl);
         drop(state);
         let _ = self.snapshot_tx.send(snapshot);
+        Ok(())
     }
 
     fn next_sequence(&self) -> u64 {
@@ -99,7 +104,7 @@ impl SomaService {
     }
 
     /// Project the latest ROS runtime samples into the Soma health wire model.
-    async fn to_health_snapshot(&self, seq: u64) -> SomaHealthSnapshot {
+    async fn to_health_snapshot(&self, seq: u64) -> anyhow::Result<SomaHealthSnapshot> {
         const HEALTH_OK: u32 = 0;
         const HEALTH_STALE: u32 = 3;
         const KIND_BODY: u32 = 1;
@@ -111,7 +116,7 @@ impl SomaService {
         const OP_ACTIVE: u32 = 4;
         const QUALITY_VALID: u32 = 0;
         const QUALITY_STALE: u32 = 1;
-        let runtime = self.runtime.snapshot().await;
+        let runtime = self.runtime.snapshot().await?;
         let runtime_detail = runtime.warnings.join("; ");
         let mut components = vec![component(
             "body",
@@ -246,7 +251,7 @@ impl SomaService {
             ]);
         }
         let timestamp_ns = (runtime.observed_at_unix * 1_000_000_000.0) as i64;
-        SomaHealthSnapshot {
+        Ok(SomaHealthSnapshot {
             schema_version: 1,
             body_id: self.body.robot_id.clone(),
             seq,
@@ -263,7 +268,7 @@ impl SomaService {
             safety_endpoints: Vec::new(),
             faults: Vec::new(),
             metrics,
-        }
+        })
     }
 }
 
@@ -432,13 +437,9 @@ impl RobonixSystemSomaFootprint for SomaService {
     }
 }
 
-/// Return the current Unix timestamp in nanoseconds, saturating at the wire limit.
-fn unix_time_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64
+/// Reject unavailable reference time and timestamps outside the signed wire range.
+fn unix_time_ns() -> std::io::Result<i64> {
+    i64::try_from(robonix_chronos_clock::reference_timestamp_ns()?).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
@@ -509,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn health_snapshot_is_explicit_when_no_samples_exist() {
         let service = SomaService::new(fixture_body());
-        service.publish_runtime_snapshot().await;
+        service.publish_runtime_snapshot().await.unwrap();
         let response = service
             .get_health(Request::new(GetHealthRequest {}))
             .await
@@ -531,11 +532,11 @@ mod tests {
     #[tokio::test]
     async fn primitive_snapshot_wins_until_its_ttl_expires() {
         let service = SomaService::new(fixture_body());
-        let mut primitive = service.to_health_snapshot(0).await;
+        let mut primitive = service.to_health_snapshot(0).await.unwrap();
         primitive.ttl_ms = 20;
         primitive.components[0].detail = "primitive".into();
-        service.publish_primitive_snapshot(primitive).await;
-        service.publish_runtime_snapshot().await;
+        service.publish_primitive_snapshot(primitive).await.unwrap();
+        service.publish_runtime_snapshot().await.unwrap();
 
         let active = service
             .get_health(Request::new(GetHealthRequest {}))
@@ -548,7 +549,7 @@ mod tests {
         assert_eq!(active.components[0].detail, "primitive");
 
         tokio::time::sleep(Duration::from_millis(25)).await;
-        service.publish_runtime_snapshot().await;
+        service.publish_runtime_snapshot().await.unwrap();
         let fallback = service
             .get_health(Request::new(GetHealthRequest {}))
             .await

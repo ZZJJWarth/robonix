@@ -273,7 +273,9 @@ async fn main() -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             tick.tick().await;
-            snapshot_service.publish_runtime_snapshot().await;
+            if let Err(error) = snapshot_service.publish_runtime_snapshot().await {
+                robonix_scribe::error!("[soma/state] snapshot publication failed: {error:#}");
+            }
         }
     });
     let (body_shutdown_tx, body_shutdown_rx) = tokio::sync::oneshot::channel();

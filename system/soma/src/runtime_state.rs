@@ -4,7 +4,6 @@ use crate::store::GripperConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 pub const FRESHNESS_SECS: f64 = 2.0;
@@ -17,8 +16,8 @@ pub struct RuntimeStateStore {
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeState {
-    arms: BTreeMap<String, JointSample>,
-    chassis: BTreeMap<String, OdomSample>,
+    arms: BTreeMap<String, (JointSample, u64)>,
+    chassis: BTreeMap<String, (OdomSample, u64)>,
     warnings: Vec<String>,
 }
 
@@ -95,7 +94,8 @@ impl RuntimeStateStore {
         }
     }
 
-    pub async fn apply_line(&self, line: &str) -> Result<(), serde_json::Error> {
+    /// Decode an event and record local steady receipt time before storing samples.
+    pub async fn apply_line(&self, line: &str) -> anyhow::Result<()> {
         let event: MonitorEvent = serde_json::from_str(line)?;
         let mut state = self.inner.write().await;
         match event {
@@ -103,10 +103,16 @@ impl RuntimeStateStore {
                 let _ = subscriptions;
             }
             MonitorEvent::JointState(sample) => {
-                state.arms.insert(sample.provider_id.clone(), sample);
+                let received = robonix_chronos_clock::steady_time()?.timestamp_ns;
+                state
+                    .arms
+                    .insert(sample.provider_id.clone(), (sample, received));
             }
             MonitorEvent::Odom(sample) => {
-                state.chassis.insert(sample.provider_id.clone(), sample);
+                let received = robonix_chronos_clock::steady_time()?.timestamp_ns;
+                state
+                    .chassis
+                    .insert(sample.provider_id.clone(), (sample, received));
             }
             MonitorEvent::Warning { message } => {
                 if !state.warnings.contains(&message) {
@@ -118,15 +124,17 @@ impl RuntimeStateStore {
         Ok(())
     }
 
-    pub async fn snapshot(&self) -> RuntimeSnapshot {
-        let now = now_unix();
+    /// Read reference time for publication and steady sample ages without using source stamps.
+    pub async fn snapshot(&self) -> anyhow::Result<RuntimeSnapshot> {
         let state = self.inner.read().await;
+        let now = now_unix()?;
+        let steady = robonix_chronos_clock::steady_time()?.timestamp_ns;
         let mut warnings = state.warnings.clone();
         let arms: Vec<ArmSnapshot> = state
             .arms
             .values()
-            .map(|sample| {
-                let age_sec = (now - sample.received_at_unix).max(0.0);
+            .map(|(sample, received)| {
+                let age_sec = age_seconds(steady, *received)?;
                 let fresh = age_sec <= FRESHNESS_SECS;
                 let grippers = self
                     .grippers
@@ -175,57 +183,104 @@ impl RuntimeStateStore {
                         }
                     })
                     .collect();
-                ArmSnapshot {
+                Ok(ArmSnapshot {
                     provider_id: sample.provider_id.clone(),
                     names: sample.names.clone(),
                     positions: sample.positions.clone(),
                     grippers,
                     fresh,
                     age_sec,
-                }
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
         let chassis: Vec<ChassisSnapshot> = state
             .chassis
             .values()
             .cloned()
-            .map(|sample| {
-                let age_sec = (now - sample.received_at_unix).max(0.0);
+            .map(|(sample, received)| {
+                let age_sec = age_seconds(steady, received)?;
                 let fresh = age_sec <= FRESHNESS_SECS;
                 let linear_speed = sample.linear.iter().map(|v| v * v).sum::<f64>().sqrt();
                 let angular_speed = sample.angular.iter().map(|v| v * v).sum::<f64>().sqrt();
-                ChassisSnapshot {
+                Ok(ChassisSnapshot {
                     moving: fresh && (linear_speed > 0.02 || angular_speed > 0.03),
                     sample,
                     fresh,
                     age_sec,
-                }
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
         if arms.is_empty() {
             warnings.push("no arm joint-state sample is available".into());
         }
         if chassis.is_empty() {
             warnings.push("no chassis odometry sample is available".into());
         }
-        RuntimeSnapshot {
+        Ok(RuntimeSnapshot {
             observed_at_unix: now,
             arms,
             chassis,
             warnings,
-        }
+        })
     }
 }
 
-fn now_unix() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+fn now_unix() -> std::io::Result<f64> {
+    Ok(robonix_chronos_clock::reference_timestamp_ns()? as f64 / 1_000_000_000.0)
+}
+
+/// Reject steady-clock regression rather than marking a sample fresh.
+fn age_seconds(now: u64, received: u64) -> anyhow::Result<f64> {
+    let elapsed = now
+        .checked_sub(received)
+        .ok_or_else(|| anyhow::anyhow!("Chronos steady time regressed"))?;
+    Ok(elapsed as f64 / 1_000_000_000.0)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod clock_faults {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../chronos/clock/tests/support/mod.rs"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    /// Reference steps do not affect sample ages; failed steady receipts do not replace data.
+    fn freshness_uses_local_steady_receipt() {
+        clock_faults::run_case(
+            "runtime_state::tests::freshness_uses_local_steady_receipt",
+            || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let store = RuntimeStateStore::new(vec![]);
+                let line = r#"{"kind":"odom","provider_id":"chassis","received_at_unix":1,"linear":[1,0,0]}"#;
+                store.apply_line(line).await.unwrap();
+                for mode in [8, 32, 0] {
+                    clock_faults::mode(mode);
+                    let snapshot = store.snapshot().await.unwrap();
+                    assert!(snapshot.chassis[0].fresh && snapshot.chassis[0].moving);
+                    assert!(snapshot.chassis[0].age_sec < 1.0);
+                }
+                for mode in [1, 2, 4] {
+                    clock_faults::mode(mode);
+                    assert!(store.snapshot().await.is_err());
+                }
+                clock_faults::mode(0);
+                let receipt = store.inner.read().await.chassis["chassis"].1;
+                clock_faults::mode(16);
+                assert!(store.apply_line(line).await.is_err());
+                assert_eq!(store.inner.read().await.chassis["chassis"].1, receipt);
+                store.inner.write().await.chassis.get_mut("chassis").unwrap().1 -= 3_000_000_000;
+                let snapshot = store.snapshot().await.unwrap();
+                assert!(!snapshot.chassis[0].fresh && !snapshot.chassis[0].moving);
+            });
+            },
+        );
+    }
+
     use super::*;
 
     fn gripper() -> GripperConfig {
@@ -241,14 +296,14 @@ mod tests {
     #[tokio::test]
     async fn calibrated_open_gripper_is_not_reported_as_holding() {
         let store = RuntimeStateStore::new(vec![gripper()]);
-        let now = now_unix();
+        let now = now_unix().unwrap();
         store
             .apply_line(&format!(
                 r#"{{"kind":"joint_state","provider_id":"piper_ctl","received_at_unix":{now},"names":["joint1","gripper"],"positions":[0.0,0.06937]}}"#
             ))
             .await
             .unwrap();
-        let snapshot = store.snapshot().await;
+        let snapshot = store.snapshot().await.unwrap();
         assert_eq!(snapshot.arms[0].grippers[0].state, "open");
         assert!(!snapshot.arms[0].grippers[0].likely_holding);
     }
@@ -256,27 +311,27 @@ mod tests {
     #[tokio::test]
     async fn closed_gripper_is_reported_as_likely_holding() {
         let store = RuntimeStateStore::new(vec![gripper()]);
-        let now = now_unix();
+        let now = now_unix().unwrap();
         store
             .apply_line(&format!(
                 r#"{{"kind":"joint_state","provider_id":"piper_ctl","received_at_unix":{now},"names":["gripper"],"positions":[0.03]}}"#
             ))
             .await
             .unwrap();
-        let snapshot = store.snapshot().await;
+        let snapshot = store.snapshot().await.unwrap();
         assert!(snapshot.arms[0].grippers[0].likely_holding);
     }
 
     #[tokio::test]
     async fn chassis_velocity_drives_motion_state() {
         let store = RuntimeStateStore::new(vec![]);
-        let now = now_unix();
+        let now = now_unix().unwrap();
         store
             .apply_line(&format!(
                 r#"{{"kind":"odom","provider_id":"ranger_chassis","received_at_unix":{now},"linear":[0.2,0.0,0.0],"angular":[0.0,0.0,0.0]}}"#
             ))
             .await
             .unwrap();
-        assert!(store.snapshot().await.chassis[0].moving);
+        assert!(store.snapshot().await.unwrap().chassis[0].moving);
     }
 }

@@ -56,6 +56,19 @@ pub fn reference_time() -> std::io::Result<VirtualReferenceTime> {
     Ok(snapshot()?.reference)
 }
 
+/// Read an available, nonnegative reference timestamp for epoch-based wire fields.
+/// Unverified Linux time is accepted; read, quality and range failures remain errors.
+pub fn reference_timestamp_ns() -> std::io::Result<u64> {
+    let reference = reference_time()?;
+    if !reference.available {
+        return Err(std::io::Error::other(format!(
+            "Chronos reference unavailable: {}",
+            reference.reason
+        )));
+    }
+    u64::try_from(reference.timestamp_ns).map_err(std::io::Error::other)
+}
+
 /// Read local steady time independently of reference health or ownership.
 pub fn steady_time() -> std::io::Result<VirtualSteadyTime> {
     #[cfg(target_os = "linux")]
