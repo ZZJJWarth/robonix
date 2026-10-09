@@ -14,6 +14,27 @@ with `CLOCK_MONOTONIC`. It does not yet read ROS clocks or supervise PTP.
 
 ## Run the gRPC component
 
+To boot the Webots deployment with Chronos, install the workspace binaries with
+`make install`, set the usual `VLM_BASE_URL`, `VLM_API_KEY`, and `VLM_MODEL`, then
+run these commands from the repository root in separate terminals:
+
+```bash
+# Terminal 1
+bash examples/webots/sim/start.sh
+
+# Terminal 2
+bash system/chronos/start_webots.sh
+```
+
+The script generates `examples/webots/.robonix_manifest.chronos.yaml` from the
+default Webots manifest and enables Linux reference quality on port 50094.
+It does not enable device observation collection. Boot options are forwarded
+to `rbnx boot`. For the full TIAGo, start the simulator with
+`--tiago-variant full` and invoke this script with `ROBONIX_TIAGO_VARIANT=full`.
+Check registration with `rbnx caps -v | rg chronos`. Stop the deployment with
+`rbnx shutdown -f examples/webots/.robonix_manifest.chronos.yaml`; stop the
+simulator with `bash examples/webots/sim/stop.sh`.
+
 Install with `make build-chronos` or build with `cargo build -p robonix-chronos`.
 With Atlas running, start `robonix-chronos` for Linux-reference-only quality,
 or pass `--config <yaml>` using the `chronos.core` format shown below.
