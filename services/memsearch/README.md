@@ -100,6 +100,9 @@ rbnx build -p services/memsearch
 
 The build script creates `rbnx-build/venv`, installs the locked Python
 dependencies, generates the MCP and protobuf modules, and warms the ONNX model.
+It defaults to Python 3.12, which has wheels for the pinned NumPy and ONNX
+dependencies. `uv` downloads the interpreter when needed and replaces an
+existing virtual environment if its interpreter does not match.
 The warm-up is attempted up to three times and the build fails if the model
 cannot be loaded.
 
@@ -109,6 +112,7 @@ The build script reads the following variables:
 | --- | --- | --- |
 | `RBNX_BUILD_CLEAN` | unset | Set to `1` to remove `rbnx-build` before rebuilding. |
 | `RBNX_PACKAGE_ROOT` | detected from the script | Explicit package root used by the build script. |
+| `UV_PYTHON` | `3.12` | Python interpreter used to create and synchronize the virtual environment. |
 | `UV_INDEX_URL` | Tsinghua PyPI mirror | Python package index used by `uv`. |
 | `PIP_INDEX_URL` | Tsinghua PyPI mirror | Package index inherited by Python packaging tools. |
 | `HF_ENDPOINT` | `https://huggingface.co` | Hugging Face Hub endpoint used to warm the embedding model. |

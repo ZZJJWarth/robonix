@@ -24,6 +24,9 @@ set -euo pipefail
 : "${UV_INDEX_URL:=https://pypi.tuna.tsinghua.edu.cn/simple}"
 : "${PIP_INDEX_URL:=https://pypi.tuna.tsinghua.edu.cn/simple}"
 export UV_INDEX_URL PIP_INDEX_URL
+# NumPy 1.x and the pinned ONNX runtime have Python 3.12 wheels.
+: "${UV_PYTHON:=3.12}"
+export UV_PYTHON
 PKG="${RBNX_PACKAGE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$PKG"
 
@@ -50,7 +53,7 @@ fi
 
 # ── 2. uv sync (deps from pyproject.toml + uv.lock into the venv) ──────────
 echo "[build] uv sync (pyproject.toml → $VENV)"
-VIRTUAL_ENV="$PKG/$VENV" uv sync --active --no-managed-python
+VIRTUAL_ENV="$PKG/$VENV" uv sync --active --python "$UV_PYTHON"
 
 # ── 3. Codegen (.proto + grpc stubs + MCP dataclasses → rbnx-build/codegen/) ─
 FLAGS=(--mcp)
