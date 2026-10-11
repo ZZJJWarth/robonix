@@ -24,7 +24,7 @@ import json
 import logging
 import os
 import re
-import time
+from scene_service import clock
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Optional
@@ -307,7 +307,7 @@ def _state_payload(registry: ObjectRegistry,
         "occupancy": occupancy_payload(hub),
         "annotations": regions,
         "map_binding": map_binding,
-        "stamp_unix": time.time(),
+        "stamp_unix": clock.time(),
     }
 
 
@@ -1164,9 +1164,9 @@ def make_app(*, registry: ObjectRegistry,
             semantic_hold["reason"] = f"the last load of {map_id} did not complete"
             # Restore semantic state only once the loaded map's grid arrives.
             ready_timeout_s = float(os.environ.get("SCENE_MAP_READY_TIMEOUT_S", "20"))
-            deadline = time.monotonic() + ready_timeout_s
+            deadline = clock.monotonic() + ready_timeout_s
             occupancy_ready = False
-            while time.monotonic() < deadline:
+            while clock.monotonic() < deadline:
                 if hub is not None and hub.has("occupancy_grid"):
                     msg, stamp, count = hub.latest("occupancy_grid")
                     if (
@@ -1929,7 +1929,7 @@ def _gpu_sample():
 
 def _cost_sample(detector):
     """One reading of what the running perception backend costs."""
-    now = time.time()
+    now = clock.time()
     sample = {"at": now}
 
     backend = getattr(detector, "backend_name", None)

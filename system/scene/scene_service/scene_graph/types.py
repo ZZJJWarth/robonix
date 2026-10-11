@@ -2,7 +2,7 @@
 """Core data structures for the Scene Graph layer."""
 from __future__ import annotations
 
-import time
+from scene_service import clock
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -69,7 +69,7 @@ class SceneGraphEdge:
     confidence: float = 0.0
     method: str = "llm"       # "llm" | "geometric" | "cached" | "llm_fail"
     reason: str = ""
-    updated_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=clock.time)
     # Consecutive rebuilds this edge went unconfirmed (builder hysteresis).
     stale_rounds: int = 0
 
@@ -85,4 +85,4 @@ class SceneGraphSnapshot:
     """Immutable snapshot of the full scene graph at a point in time."""
     nodes: dict[str, SceneGraphNode] = field(default_factory=dict)
     edges: list[SceneGraphEdge] = field(default_factory=list)
-    updated_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=clock.time)

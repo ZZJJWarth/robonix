@@ -7,7 +7,7 @@ import asyncio
 import copy
 import logging
 import math
-import time
+from scene_service import clock
 from typing import Any, Optional
 
 from .state import BBox3D, ObjectRegistry, Pose3D, SceneObject
@@ -306,7 +306,7 @@ class ObjectMutationCoordinator:
                 old_source = current.caption_source
                 old_at = current.caption_updated_at
                 updated = self.registry.set_object_caption(
-                    object_id, caption, source=source, now=time.time())
+                    object_id, caption, source=source, now=clock.time())
 
             persisted = False
             if partition is not None:

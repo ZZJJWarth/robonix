@@ -14,7 +14,7 @@ import logging
 import math
 import os
 import re
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -83,7 +83,7 @@ class VLMObjectDetector:
         cache_max_age_s: Optional[float] = None,
         failure_backoff_base_s: Optional[float] = None,
         failure_backoff_max_s: Optional[float] = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = clock.monotonic,
     ) -> None:
         # `rgb_fetcher` returns JPEG bytes, optionally with a delivery count so a
         # frozen stream cannot refresh objects.

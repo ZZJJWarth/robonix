@@ -459,7 +459,7 @@ def test_relation_cache_reuses_input_and_invalidates_scene_changes(caplog):
         assert first
         refreshed_at = first.edges[0].updated_at + 10.0
         with patch(
-            "scene_service.scene_graph.image_relations.time.time",
+            "scene_service.scene_graph.image_relations.clock.time",
             return_value=refreshed_at,
         ):
             second = await inferer.infer(list(reversed(nodes)), bundle)

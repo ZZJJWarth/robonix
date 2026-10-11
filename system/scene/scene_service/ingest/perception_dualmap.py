@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 import tempfile
-import time
+from scene_service import clock
 from typing import Any, Optional
 
 from .capabilities import DUALMAP_KEYS
@@ -325,11 +325,11 @@ class DualMapDetector(ConceptGraphsDetector):
             depth_m = depth_m[:, :, None]  # DualMap's DataInput carries depth as H x W x 1
         K33 = np.array([[K.fx, 0.0, K.cx], [0.0, K.fy, K.cy], [0.0, 0.0, 1.0]], dtype=np.float64)
         data = self._dm_data_input(
-            idx=self._tick_idx, time_stamp=time.time(), color=rgb, depth=depth_m,
+            idx=self._tick_idx, time_stamp=clock.time(), color=rgb, depth=depth_m,
             color_name=f"tick{self._tick_idx:06d}", intrinsics=K33,
             pose=np.asarray(pose, dtype=np.float64),
         )
-        t0 = time.monotonic()
+        t0 = clock.monotonic()
         try:
             self._dm.set_data_input(data)
             self._dm.process_detections()
@@ -397,14 +397,14 @@ class DualMapDetector(ConceptGraphsDetector):
         self._map_objects = objects
         self._all_objects = all_objects
         n = len(objects)
-        self.last_tick_s = time.monotonic() - t0
+        self.last_tick_s = clock.monotonic() - t0
         if n != self._last_lm_size or self._tick_idx % 25 == 0:
             log.info("[scene-dualmap] tick %d: %d observations, %d objects of %d tracks (%.2fs, %d frames skipped, "
                      "dropped: %d few-points %d unknown %d few-observations %d unstable "
                      "%d on-floor %d unmapped %d ground-slab %d class-outlier "
                      "%d overlapping, %d promoted)",
                      self._tick_idx, len(obs) if obs is not None else 0, n, len(self._lm.local_map),
-                     time.monotonic() - t0, self._skipped_frames,
+                      clock.monotonic() - t0, self._skipped_frames,
                      dropped["points"], dropped["unknown"], dropped["observations"], dropped["unstable"],
                      dropped["floor"], dropped["unmapped"], dropped["ground_slab"],
                      dropped["class_outlier"], dropped["overlapping"], self._promoted)
@@ -459,7 +459,7 @@ class DualMapDetector(ConceptGraphsDetector):
         key = (getattr(stamp, "sec", None), getattr(stamp, "nanosec", None)) if stamp is not None else None
         if key is not None and key == self._last_frame_key:
             return False
-        now = time.monotonic()
+        now = clock.monotonic()
         pose = np.asarray(pose, dtype=np.float64)
         keyframe = self._last_kf_pose is None or (now - self._last_kf_time) >= self._kf_time_s
         if not keyframe:

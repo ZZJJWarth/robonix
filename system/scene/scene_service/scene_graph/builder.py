@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
+from scene_service import clock
 from typing import Any, Optional
 
 from ..state.object_registry import ObjectRegistry, SceneObject
@@ -107,7 +107,7 @@ class SceneGraphBuilder:
         )
 
     async def rebuild_once(self) -> SceneGraphSnapshot:
-        t0 = time.monotonic()
+        t0 = clock.monotonic()
         objs_dict = await self.registry.snapshot()
         # Includes `missing` objects: an edge dies when an endpoint leaves the
         # registry, not when it flickers for a tick.
@@ -134,7 +134,7 @@ class SceneGraphBuilder:
                 "[scene-graph] rebuild: %d stable node(s) (<2), preserved "
                 "%d semantic edge(s)", len(stable), len(kept),
             )
-            return SceneGraphSnapshot(nodes={}, edges=kept, updated_at=time.time())
+            return SceneGraphSnapshot(nodes={}, edges=kept, updated_at=clock.time())
 
         nodes = [_object_to_node(o) for o in stable]
 
@@ -169,7 +169,7 @@ class SceneGraphBuilder:
         snapshot = SceneGraphSnapshot(
             nodes={n.object_id: n for n in nodes},
             edges=edges,
-            updated_at=time.time(),
+            updated_at=clock.time(),
         )
 
         if self.object_store is not None:
@@ -181,7 +181,7 @@ class SceneGraphBuilder:
 
         log.info(
             "[scene-graph] rebuild: %d nodes, %d edges, %.1fs",
-            len(nodes), len(edges), time.monotonic() - t0,
+            len(nodes), len(edges), clock.monotonic() - t0,
         )
         return snapshot
 

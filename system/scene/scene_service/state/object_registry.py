@@ -8,7 +8,7 @@ import asyncio
 import math
 import warnings
 import re
-import time
+from scene_service import clock
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -699,4 +699,4 @@ def _dist3(a: Pose3D, b: Pose3D) -> float:
 
 def now_unix() -> float:
     """Wall-clock unix seconds."""
-    return time.time()
+    return clock.time()

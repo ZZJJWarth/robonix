@@ -13,7 +13,7 @@ import asyncio
 import base64
 import logging
 import os
-import time
+from scene_service import clock
 from typing import Any, Dict, Set
 
 import numpy as np
@@ -144,7 +144,7 @@ class ObjectWatchdog:
             "session_id": "scene-watchdog",
             "plan_id": "scene-watchdog",
             "log_record": {
-                "ts": time.time_ns(),
+                "ts": clock.time_ns(),
                 "level": "Info",
                 "tag": "scene",
                 "msg": f"observed new object: {obj.label}",

@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import time
+from scene_service import clock
 from pathlib import Path
 from typing import Any, Optional
 
@@ -264,7 +265,7 @@ def _discover_map_binding(wait_s: float) -> Optional[dict]:
     and 5 s for the sample; `wait_s <= 0` disables the probe."""
     if wait_s <= 0:
         return None
-    deadline = time.monotonic() + wait_s
+    deadline = clock.monotonic() + wait_s
     while True:
         try:
             spec = _resolve_one_contract(
@@ -289,7 +290,7 @@ def _discover_map_binding(wait_s: float) -> Optional[dict]:
                     spec.topic,
                 )
             return sample
-        if time.monotonic() >= deadline:
+        if clock.monotonic() >= deadline:
             return None
         time.sleep(0.5)
 
@@ -360,10 +361,10 @@ class _SelfTracker:
         return self._latest
 
     async def on_pose(self, x: float, y: float, z: float, yaw: float) -> None:
-        self._latest = (x, y, z, yaw)
         wf = self.world_frame_id
         footprint = self.robot_geometry.current()
         if not wf or footprint is None:
+            self._latest = (x, y, z, yaw)
             return
         async with self.registry.lock():
             if (
@@ -390,21 +391,24 @@ class _SelfTracker:
             else:
                 obj = self.registry.get_object(self._object_id)
                 if obj is not None:
-                    obj.bbox = BBox3D(
+                    bbox = BBox3D(
                         size_x=footprint.size_x_m,
                         size_y=footprint.size_y_m,
                         size_z=0.0,
                         yaw=yaw,
                         frame_id=wf,
                     )
+                    now = now_unix()
+                    obj.bbox = bbox
                     self.registry.update_object_pose(
                         obj,
                         Pose3D(x=x, y=y, z=z, yaw=yaw, frame_id=wf),
                         new_confidence=1.0,
-                        now=now_unix(),
+                        now=now,
                         ema_pose=1.0,  # robot's own pose: hard-overwrite
                         ema_conf=1.0,
                     )
+            self._latest = (x, y, z, yaw)
 
 
 # ── Stale-tick: flip missing flag, and collapse duplicates ─────────────────
@@ -459,12 +463,16 @@ async def _stale_tick(registry: ObjectRegistry, *, period_s: float = 1.0) -> Non
     tick = 0
     while True:
         tick += 1
-        async with registry.lock():
-            flipped = registry.mark_stale(now_unix())
-            merged = []
-            if merge_xy > 0.0 and tick % _MERGE_EVERY_N_TICKS == 0:
-                merged = registry.merge_duplicates(
-                    now_unix(), xy_m=merge_xy, z_m=merge_z)
+        try:
+            async with registry.lock():
+                flipped = registry.mark_stale(now_unix())
+                merged = []
+                if merge_xy > 0.0 and tick % _MERGE_EVERY_N_TICKS == 0:
+                    merged = registry.merge_duplicates(
+                        now_unix(), xy_m=merge_xy, z_m=merge_z)
+        except OSError:
+            await asyncio.sleep(period_s)
+            continue
         if flipped:
             log.debug("marked %d object(s) missing (grace expired)", flipped)
         for absorbed, survivor in merged:
@@ -584,9 +592,11 @@ async def _rerun_tick(sink, registry, detector, hub, sg_store=None,
     from .rerun_sink import relation_edges
 
     ticks = 0
-    started = time.time()
+    started = None
     while True:
         try:
+            if started is None:
+                started = clock.time()
             if not sink.ready:  # the export is the cost; nobody is watching
                 await asyncio.sleep(period_s)
                 continue
@@ -600,7 +610,7 @@ async def _rerun_tick(sink, registry, detector, hub, sg_store=None,
             def publish():
                 # One thread: rerun's timeline is per thread, and PNG work
                 # and per-point loops stay off the event loop.
-                sink.set_time(time.time() - started)
+                sink.set_time(clock.time() - started)
                 occupancy = web_ui.occupancy_payload(hub)
                 sink.log_occupancy(occupancy)
                 sink.log_objects(live, clouds, colours)
@@ -735,8 +745,8 @@ async def _start_ros_ingest(
     # The camera often registers after the chassis; give it a bounded wait so
     # the RGB-D path is not lost to a startup race.
     perception_wait_s = float(os.environ.get("SCENE_PERCEPTION_WAIT_S", "30"))
-    deadline = time.time() + perception_wait_s
-    while time.time() < deadline and not (hub.has("rgb") and hub.has("depth")):
+    deadline = clock.time() + perception_wait_s
+    while clock.time() < deadline and not (hub.has("rgb") and hub.has("depth")):
         new_specs = _build_topic_specs(
             explicit, atlas_stub, transport, camera_provider_id
         )
@@ -1068,65 +1078,68 @@ async def _self_pose_loop(
     missing_frame_warned = False
     stale_warned = False
     while True:
-        x = y = z = yaw = None
-        frame_id: Optional[str] = None
+        try:
+            x = y = z = yaw = None
+            frame_id: Optional[str] = None
 
-        if hub.has("pose"):  # SLAM-corrected, preferred
-            msg, stamp_unix, _count = hub.latest("pose")
-            if (
-                msg is not None
-                and stamp_unix > 0
-                and time.time() - stamp_unix <= pose_max_age_s
-            ):
-                x, y, z, yaw, frame_id = read(msg)
+            if hub.has("pose"):  # SLAM-corrected, preferred
+                msg, stamp_unix, _count = hub.latest("pose")
+                if (
+                    msg is not None
+                    and stamp_unix > 0
+                    and clock.time() - stamp_unix <= pose_max_age_s
+                ):
+                    x, y, z, yaw, frame_id = read(msg)
 
-        if x is None and hub.has("odom"):
-            msg, stamp_unix, _count = hub.latest("odom")
-            footprint = self_tracker.robot_geometry.current()
-            child_frame = str(
-                getattr(msg, "child_frame_id", "") or ""
-            ).strip() if msg is not None else ""
-            if (
-                msg is not None
-                and stamp_unix > 0
-                and time.time() - stamp_unix <= pose_max_age_s
-                and footprint is not None
-                and child_frame == footprint.base_frame
-            ):
-                x, y, z, yaw, frame_id = read(msg)
+            if x is None and hub.has("odom"):
+                msg, stamp_unix, _count = hub.latest("odom")
+                footprint = self_tracker.robot_geometry.current()
+                child_frame = str(
+                    getattr(msg, "child_frame_id", "") or ""
+                ).strip() if msg is not None else ""
+                if (
+                    msg is not None
+                    and stamp_unix > 0
+                    and clock.time() - stamp_unix <= pose_max_age_s
+                    and footprint is not None
+                    and child_frame == footprint.base_frame
+                ):
+                    x, y, z, yaw, frame_id = read(msg)
 
-        if x is not None and frame_id:
-            self_tracker.world_frame_id = frame_id
-            await self_tracker.on_pose(
-                x, y, z, yaw  # pyright: ignore[reportArgumentType]
-            )
-            missing_frame_warned = False
-            stale_warned = False
-        elif x is not None and not missing_frame_warned:
-            log.warning(
-                "[scene] pose sample has no header.frame_id; spatial self state "
-                "is withheld until the provider publishes its coordinate frame"
-            )
-            missing_frame_warned = True
-        elif not stale_warned:
-            latest_age = min(
-                (
-                    time.time() - stamp
-                    for kind in ("pose", "odom")
-                    if hub.has(kind)
-                    for _msg, stamp, _count in [hub.latest(kind)]
-                    if stamp > 0.0
-                ),
-                default=0.0,
-            )
-            if latest_age > pose_max_age_s:
-                log.warning(
-                    "[scene] latest pose/odometry sample is %.2fs old; "
-                    "spatial self updates are withheld (limit %.2fs)",
-                    latest_age,
-                    pose_max_age_s,
+            if x is not None and frame_id:
+                self_tracker.world_frame_id = frame_id
+                await self_tracker.on_pose(
+                    x, y, z, yaw  # pyright: ignore[reportArgumentType]
                 )
-                stale_warned = True
+                missing_frame_warned = False
+                stale_warned = False
+            elif x is not None and not missing_frame_warned:
+                log.warning(
+                    "[scene] pose sample has no header.frame_id; spatial self state "
+                    "is withheld until the provider publishes its coordinate frame"
+                )
+                missing_frame_warned = True
+            elif not stale_warned:
+                latest_age = min(
+                    (
+                        clock.time() - stamp
+                        for kind in ("pose", "odom")
+                        if hub.has(kind)
+                        for _msg, stamp, _count in [hub.latest(kind)]
+                        if stamp > 0.0
+                    ),
+                    default=0.0,
+                )
+                if latest_age > pose_max_age_s:
+                    log.warning(
+                        "[scene] latest pose/odometry sample is %.2fs old; "
+                        "spatial self updates are withheld (limit %.2fs)",
+                        latest_age,
+                        pose_max_age_s,
+                    )
+                    stale_warned = True
+        except OSError:
+            pass
         await asyncio.sleep(0.2)
 
 
@@ -1200,7 +1213,7 @@ def _camera_to_world_from_contracts(
         message, stamp_unix, _count = hub.latest(kind)
         if message is None or stamp_unix <= 0:
             continue
-        if pose_max_age_s > 0.0 and time.time() - stamp_unix > pose_max_age_s:
+        if pose_max_age_s > 0.0 and clock.time() - stamp_unix > pose_max_age_s:
             continue
         world_frame = str(
             getattr(getattr(message, "header", None), "frame_id", "") or ""
@@ -1812,7 +1825,7 @@ async def _run_active(config: dict) -> None:
         # Unset SCENE_OBJECT_VIEWS_DIR means no photographs, and no captions.
         object_views = store_from_env()
         ephemeral_session_id = "session-" + time.strftime(
-            "%Y%m%dT%H%M%SZ", time.gmtime())
+            "%Y%m%dT%H%M%SZ", time.gmtime(clock.time()))
         if object_views is not None:
             object_views.session_id = ephemeral_session_id
             # Last run's unsaved photographs show a map this one never saw.

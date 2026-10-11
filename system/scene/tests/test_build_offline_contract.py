@@ -93,6 +93,16 @@ class OfflineBuildContractTests(unittest.TestCase):
         (fake_bin / "rbnx").write_text(
             "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
         )
+        (fake_bin / "uvx").write_text(
+            """#!/usr/bin/env bash
+set -eu
+printf '%s\\n' "$@" > "$FAKE_CLOCK_BUILD_LOG"
+while [[ "$1" != --out ]]; do shift; done
+mkdir -p "$2"
+printf 'wheel' > "$2/robonix_chronos_clock-test.whl"
+""",
+            encoding="utf-8",
+        )
         (fake_bin / "docker").write_text(
             """#!/usr/bin/env bash
 set -eu
@@ -129,7 +139,7 @@ printf 'downloaded-clip' > "$out"
 """,
             encoding="utf-8",
         )
-        for command in ("rbnx", "docker", "curl"):
+        for command in ("rbnx", "docker", "curl", "uvx"):
             (fake_bin / command).chmod(0o755)
 
         env = os.environ.copy()
@@ -142,6 +152,7 @@ printf 'downloaded-clip' > "$out"
                 "RBNX_HF_MIRROR": "https://hf.invalid",
                 "FAKE_DOCKER_LOG": str(root / "docker.log"),
                 "FAKE_CURL_LOG": str(root / "curl.log"),
+                "FAKE_CLOCK_BUILD_LOG": str(root / "clock-build.log"),
             }
         )
         return scene, env
@@ -163,6 +174,10 @@ printf 'downloaded-clip' > "$out"
             root = Path(tmp)
             scene, env = self._fixture(root, include_clip=True)
             args = self._run_build(scene, env)
+            clock_args = (root / "clock-build.log").read_text().splitlines()
+            self.assertIn(str(root / "system/chronos/clock/Cargo.toml"), clock_args)
+            self.assertEqual(clock_args[:4], ["maturin", "build", "--release", "--locked"])
+            self.assertTrue((scene / "docker/_chronos_wheels/robonix_chronos_clock-test.whl").exists())
             self.assertFalse(any(arg.startswith("BUILDKIT_SYNTAX=") for arg in args))
             self.assertFalse((root / "curl.log").exists())
 

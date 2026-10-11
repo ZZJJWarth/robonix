@@ -11,6 +11,7 @@ robonix_mcp_types/
 # Pre-fetched model weights (yolov8l-world.pt etc.) live under docker/
 # during build to keep the docker COPY cache-stable; not committed.
 docker/_weights/
+docker/_chronos_wheels/
 
 # Container-side editable install cache that scene's build.sh uses.
 .uv-cache/

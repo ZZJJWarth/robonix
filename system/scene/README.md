@@ -53,6 +53,27 @@ The metric pipeline is ConceptGraphs-style per-frame perception with 4 stages:
 
 Periodic cleanup (every 30 ticks) runs concept-graphs's `denoise_objects` + `filter_objects` + `merge_overlap_objects` so duplicates from edge-case detections eventually collapse.
 
+## Time source
+
+Scene reads local time through the native `robonix-chronos-clock` binding.
+Unix timestamps stay float seconds; memgraph log timestamps stay integer
+nanoseconds. Existing wall-clock age and TTL comparisons keep their behavior
+across reference-clock steps. Monotonic waits, keyframe intervals and VLM
+backoff use Chronos steady time. ROS header timestamps and TF queries retain
+the provider's time domain. Asyncio, ROS and third-party library timers remain
+owned by those libraries.
+
+Clock read errors are logged and raised without a fallback timestamp. ROS
+ingest skips failed receipts before replacing the message, timestamp or count;
+the stale and pose loops retry at their normal intervals.
+
+`scripts/build.sh` builds the binding with Rust and `uvx maturin`, then installs
+the wheel into both Docker variants or the Jetson native Python environment.
+DualMap inherits the binding from the Scene base image. Build on the deployment
+architecture and rebuild existing images before starting the migrated service.
+For workspace development, `uv sync --package robonix-system-scene` installs
+the declared binding dependency.
+
 ## Deployment targets (x86 / Jetson)
 
 Unlike the Rust system binaries (atlas / executor / pilot / liaison — one

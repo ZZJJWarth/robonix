@@ -4312,6 +4312,7 @@ dependencies = [
     { name = "pymilvus" },
     { name = "pyyaml" },
     { name = "robonix-api" },
+    { name = "robonix-chronos-clock" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "uvicorn" },
@@ -4331,6 +4332,7 @@ requires-dist = [
     { name = "pymilvus", specifier = ">=2.5.0,!=2.6.10" },
     { name = "pyyaml" },
     { name = "robonix-api", editable = "pylib/robonix-api" },
+    { name = "robonix-chronos-clock", editable = "system/chronos/clock" },
     { name = "scipy", specifier = ">=1.11" },
     { name = "uvicorn" },
 ]

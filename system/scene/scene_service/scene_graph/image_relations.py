@@ -13,7 +13,7 @@ import copy
 import logging
 import math
 import os
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
@@ -292,7 +292,7 @@ class ImageRelationInferer:
         frame_change_threshold: Optional[float] = None,
         failure_backoff_base_s: Optional[float] = None,
         failure_backoff_max_s: Optional[float] = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = clock.monotonic,
     ) -> None:
         self.llm_client = llm_client
         if max_dim is None:
@@ -395,7 +395,7 @@ class ImageRelationInferer:
         if unchanged and self._last_success_edges is not None:
             self._record_skip("unchanged-input")
             edges = copy.deepcopy(self._last_success_edges)
-            now_unix = time.time()
+            now_unix = clock.time()
             for edge in edges:
                 edge.method = "cached"
                 edge.updated_at = now_unix

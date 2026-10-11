@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Any
 
@@ -113,8 +113,12 @@ class _LatestSlot:
 
     def write(self, msg: Any) -> None:
         with self._lock:
+            try:
+                stamp_unix = clock.time()
+            except OSError:
+                return
             self._msg = msg
-            self._stamp_unix = time.time()
+            self._stamp_unix = stamp_unix
             self._count += 1
 
     def read(self) -> tuple[Any, float, int]:

@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import threading
-import time
+from scene_service import clock
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
@@ -161,7 +161,7 @@ def make_meta(map_id: str, partition: str, seq: int, *,
         map_id=sanitize_map_id(map_id),
         object_partition=partition,
         save_seq=seq,
-        saved_at_unix=time.time(),
+        saved_at_unix=clock.time(),
         mapping_generation=generation,
         mapping_mode=mode,
     )

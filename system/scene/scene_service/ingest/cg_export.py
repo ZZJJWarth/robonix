@@ -9,7 +9,7 @@ from __future__ import annotations
 import gzip
 import os
 import pickle
-import time
+from scene_service import clock
 from pathlib import Path
 
 
@@ -30,7 +30,7 @@ def export_map_objects(
         "bg_objects": bg_objects.to_serializable() if bg_objects is not None else [],
         "clip_model": clip_model,
         "clip_pretrained": clip_pretrained,
-        "exported_at": time.time(),
+        "exported_at": clock.time(),
         "object_count": len(map_objects),
     }
     final = out_dir / f"full_pcd_{exp_name}.pkl.gz"

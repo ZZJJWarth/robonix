@@ -7,7 +7,7 @@ import logging
 import math
 import os
 import threading
-import time
+from scene_service import clock
 
 from .geometry_gates import KnownGround, fraction_on_known_ground
 import uuid
@@ -756,13 +756,13 @@ class ConceptGraphsDetector:
     # Read by the rerun viewer tick and /api/objects3d.
     def export_3d_snapshot(self, max_points_per_obj: int = 256) -> dict:
         if self._map_objects is None:
-            return {"objects": [], "stamp_unix": time.time()}
+            return {"objects": [], "stamp_unix": clock.time()}
         out = []
         # No inference lock: it can be held ~100 ms by the YOLO/SAM worker.
         try:
             map_objs = list(self._map_objects)
         except Exception:
-            return {"objects": [], "stamp_unix": time.time()}
+            return {"objects": [], "stamp_unix": clock.time()}
         # Filter to only objects that have made it into the registry —
         # `_uuid_to_oid` is the cache `_apply_snapshot` populates, so this is
         # the same set the 2D web UI / MCP API see.
@@ -853,7 +853,7 @@ class ConceptGraphsDetector:
                 })
             except Exception:  # noqa: BLE001
                 continue
-        return {"objects": out, "stamp_unix": time.time()}
+        return {"objects": out, "stamp_unix": clock.time()}
 
     # ── frame bundle (for the scene-graph image relation pass) ────────
     def latest_depth_metres(self):
@@ -875,7 +875,7 @@ class ConceptGraphsDetector:
         so the photograph shows what the label was given to.
         """
         seen = getattr(self, "_seen", None)
-        if seen is None or time.time() - seen[3] > max_age_s:
+        if seen is None or clock.time() - seen[3] > max_age_s:
             return None
         rgb, boxes, cam_xy, _ = seen
         out = []
@@ -913,23 +913,27 @@ class ConceptGraphsDetector:
     async def _loop(self) -> None:
         loop = asyncio.get_running_loop()
         while not self._stop.is_set():
-            t0 = time.monotonic()
             try:
-                await loop.run_in_executor(None, self._tick_once)
-            except Exception as e:  # noqa: BLE001
-                log.exception("cg tick error: %s", e)
-            elapsed = time.monotonic() - t0
+                t0 = clock.monotonic()
+                try:
+                    await loop.run_in_executor(None, self._tick_once)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("cg tick error: %s", e)
+                elapsed = clock.monotonic() - t0
+            except OSError:
+                await asyncio.sleep(self._period_s)
+                continue
             await asyncio.sleep(max(0.0, self._period_s - elapsed))
 
     def _tick_once(self) -> None:
         with self._inference_lock:
-            t0 = time.monotonic()
+            t0 = clock.monotonic()
             try:
                 self._tick_locked()
             finally:
                 # Timed here rather than inside, so the figure covers the whole
                 # pass and is recorded even when the pass raises.
-                self.last_tick_s = time.monotonic() - t0
+                self.last_tick_s = clock.monotonic() - t0
 
     def _tick_locked(self) -> None:
         rgb_msg = self._rgb_msg()
@@ -1360,7 +1364,7 @@ class ConceptGraphsDetector:
 
         if self._tick_boxes:
             self._seen = (rgb, dict(self._tick_boxes),
-                          (float(trans_pose[0, 3]), float(trans_pose[1, 3])), time.time())
+                          (float(trans_pose[0, 3]), float(trans_pose[1, 3])), clock.time())
         self._update_visible_absence(depth=depth, K=K, trans_pose=trans_pose)
         self._tick_idx += 1
         self._maybe_periodic_cleanup()
@@ -1773,7 +1777,7 @@ class ConceptGraphsDetector:
             if msg is None or stamp_unix <= 0:
                 continue
             max_age_s = float(getattr(self, "_pose_max_age_s", 0.0) or 0.0)
-            if max_age_s > 0.0 and time.time() - stamp_unix > max_age_s:
+            if max_age_s > 0.0 and clock.time() - stamp_unix > max_age_s:
                 continue
             world_frame = str(
                 getattr(getattr(msg, "header", None), "frame_id", "") or ""
@@ -2085,7 +2089,7 @@ class ConceptGraphsDetector:
     async def _apply_snapshot(self, snapshots: list[dict]) -> None:
         """Reconcile concept-graphs MapObjectList state into the registry
         **incrementally**."""
-        now = time.time()
+        now = clock.time()
         # A rejected snapshot below is not evidence that its object is gone:
         # visible absence decides that. Its uuid stays live, so a registered
         # object is neither updated nor evicted while the gate rejects it.

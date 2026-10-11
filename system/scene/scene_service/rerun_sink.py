@@ -21,6 +21,7 @@ import signal
 import subprocess
 import threading
 import time
+from scene_service import clock
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
@@ -229,10 +230,10 @@ def _port_is_free(port: int) -> bool:
 
 def _wait(done: Callable[[], bool], failure: str,
           check: Callable[[], None] = lambda: None) -> None:
-    deadline = time.monotonic() + _PORT_WAIT_S
+    deadline = clock.monotonic() + _PORT_WAIT_S
     while not done():
         check()
-        if time.monotonic() >= deadline:
+        if clock.monotonic() >= deadline:
             raise OSError(failure)
         time.sleep(0.1)
 

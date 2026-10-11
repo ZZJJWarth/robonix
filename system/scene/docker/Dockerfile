@@ -325,6 +325,10 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
             package/index.js package/re_viewer.js package/re_viewer_bg.wasm \
     && rm /tmp/requirements/scene-viewer.txt
 
+COPY _chronos_wheels/*.whl /tmp/chronos-wheels/
+RUN without-proxy python3 -m pip install --no-deps /tmp/chronos-wheels/*.whl \
+    && rm -rf /tmp/chronos-wheels
+
 WORKDIR /scene
 
 COPY entrypoint.sh /entrypoint.sh

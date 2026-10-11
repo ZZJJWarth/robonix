@@ -185,6 +185,10 @@ ENV SCENE_YOLO_WORLD_WEIGHTS=/opt/models/yolov8l-world.pt \
     SCENE_CLIP_MODEL=ViT-B-32 \
     SCENE_CLIP_PRETRAINED=/opt/models/open_clip_pytorch_model.bin
 
+COPY _chronos_wheels/*.whl /tmp/chronos-wheels/
+RUN without-proxy python3 -m pip install --no-deps /tmp/chronos-wheels/*.whl \
+    && rm -rf /tmp/chronos-wheels
+
 WORKDIR /scene
 COPY entrypoint.sh /entrypoint.sh
 COPY no_shm_profile.xml /etc/fastrtps_no_shm.xml
