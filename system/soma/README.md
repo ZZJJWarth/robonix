@@ -21,6 +21,43 @@ the reader-to-Soma delivery delay. Source timestamp fields retain their existing
 semantics. Clock errors fail publication without replacing the cached snapshot;
 the runtime publisher reports the failure and retries at its next interval.
 
+The ROS 2 reader uses `robonix_chronos_clock.reference_timestamp_ns()` for
+`received_at_unix`, converted to float Unix seconds at each callback. It ignores
+ROS header timestamps. A failed clock read emits a warning and skips that sample;
+cached samples keep their original freshness deadline. A missing binding prevents
+the reader from starting.
+
+Install `robonix-chronos-clock` into the Python environment running the reader,
+alongside `rclpy`, `sensor_msgs` and `nav_msgs`. From the repository root:
+
+```bash
+uvx maturin build --release --manifest-path system/chronos/clock/Cargo.toml --out /tmp/chronos-wheels
+uv venv --python /usr/bin/python3 --system-site-packages /tmp/soma-reader-venv
+uv pip install --python /tmp/soma-reader-venv/bin/python /tmp/chronos-wheels/*.whl
+```
+
+Source the ROS setup script and set `runtime_reader_command` to
+`["/tmp/soma-reader-venv/bin/python", "-u", "{script}", "{config}"]` in Soma's
+config. The interpreter must match the ROS Python version. For a container
+reader, install a compatible wheel inside that container; installing it on the
+host does not satisfy the reader's dependency. For the Webots simulator:
+
+```bash
+docker cp /tmp/chronos-wheels/robonix_chronos_clock-1.1.0b1-cp310-abi3-manylinux_2_34_x86_64.whl robonix_tiago_sim:/tmp/
+docker exec robonix_tiago_sim python3 -m pip install /tmp/robonix_chronos_clock-1.1.0b1-cp310-abi3-manylinux_2_34_x86_64.whl
+```
+
+Use the built wheel's actual filename and the simulator's container name. Repeat
+the install after recreating the container. Build the wheel for the reader's
+architecture and a compatible Linux baseline.
+
+Reader tests (with the binding installed):
+
+```bash
+/tmp/soma-reader-venv/bin/python system/soma/tests/test_runtime_ros.py
+cargo test -p robonix-soma --all-targets
+```
+
 Soma v2 uses a flat, four-key schema. Every field is required.
 
 ```yaml
