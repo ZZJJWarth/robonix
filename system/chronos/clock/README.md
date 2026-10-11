@@ -50,3 +50,46 @@ configuration parsing remain in that package. `robonix-chronos` re-exports the
 clock types, so existing consumers can keep their imports.
 
 Run `cargo test -p robonix-chronos-clock` from the repository root.
+
+## Python
+
+The independent Python package `robonix-chronos-clock` exposes the same clock
+readings through `robonix_chronos_clock`. It uses the Rust implementation inside
+the Python process and has no Python runtime dependencies. The optional Cargo
+feature `python` enables the bindings; Rust consumers need not enable it.
+
+```python
+import robonix_chronos_clock as clock
+
+reading = clock.reference_time()
+snapshot = clock.snapshot()
+steady_ns = clock.steady_time().timestamp_ns
+timestamp_ns = clock.reference_timestamp_ns()
+received_at_unix = timestamp_ns / 1_000_000_000
+```
+
+`VirtualReferenceTime`, `VirtualSteadyTime`, and `VirtualClockSnapshot` expose
+read-only fields matching their Rust types. Times remain integer nanoseconds.
+`reference_time()` and `snapshot()` expose unavailable quality as metadata;
+`reference_timestamp_ns()` rejects unavailable or negative reference time.
+Read failures raise `OSError`. There is no fallback to another clock. Reference
+generations belong to this extension in the current process, and steady time
+must not be compared across hosts. Linux reference time remains unverified.
+
+Build a wheel without modifying an existing virtual environment:
+
+```bash
+uvx maturin build --release --manifest-path system/chronos/clock/Cargo.toml \
+  --out /tmp/chronos-wheels
+```
+
+Install the resulting wheel into the Python environment that will read time.
+Wheels use the CPython 3.10+ stable ABI (`abi3`) on standard GIL-enabled CPython.
+Build separately for x86_64 and aarch64; the wheel's platform tag also determines
+which Linux distributions can install it. Source builds require Rust and
+maturin. Scene containers and Soma's ROS helper need the package installed in
+their own Python environments before migrating their calls.
+
+With the wheel installed, run
+`python -m unittest discover -s system/chronos/clock/tests -p test_python.py`.
+The failure tests require Linux and a C compiler and never change host time.
