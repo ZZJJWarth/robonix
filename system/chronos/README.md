@@ -272,6 +272,14 @@ for a low-frequency best-effort conversion. Both refresh and apply reference
 quality before returning. Direct domains deliberately expose reference
 evidence but no conversion model.
 
+`direct` assumes the driver already supplies timestamps that consumers can use
+in the declared time scale. Driver-side timestamp uncertainty is unknown;
+additional direct-domain quality management is not implemented. Chronos does
+not measure or manage the driver's alignment error, drift, or timestamp
+freshness. Quality snapshots expose reference-clock evidence and add the
+configured numeric timestamp uncertainty to reference uncertainty. That number
+is a configuration assumption, not a measured or verified direct-domain bound.
+
 Wrap the configured `Chronos` in `QualityRuntime::start` to run continuous
 in-process evaluation. The runtime evaluates once before returning, refreshes
 on the configured cadence, and exposes `latest_quality_status` without a clock
@@ -546,3 +554,9 @@ Run the core tests from the repository root:
 ```bash
 cargo test -p robonix-chronos --all-targets
 ```
+
+## TODO
+
+- Investigate whether further `direct` quality management is needed, including
+  driver-provided evidence and an explicit representation of unknown timestamp
+  uncertainty, then implement it if justified.
