@@ -17,7 +17,6 @@ use crate::runtime_state::RuntimeStateStore;
 use crate::store::{SomaBody, StoreError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -37,7 +36,7 @@ pub struct SomaService {
 #[derive(Debug, Default)]
 struct SnapshotState {
     latest: Option<SomaHealthSnapshot>,
-    primitive_valid_until: Option<Instant>,
+    primitive_valid_until: Option<u64>,
 }
 
 impl SomaService {
@@ -62,9 +61,8 @@ impl SomaService {
     pub async fn publish_runtime_snapshot(&self) -> anyhow::Result<()> {
         let mut snapshot = self.to_health_snapshot(0).await?;
         let mut state = self.snapshot_state.write().await;
-        if state
-            .primitive_valid_until
-            .is_some_and(|deadline| deadline > Instant::now())
+        if let Some(deadline) = state.primitive_valid_until
+            && deadline > robonix_chronos_clock::steady_time()?.timestamp_ns
         {
             return Ok(());
         }
@@ -81,12 +79,18 @@ impl SomaService {
         &self,
         mut snapshot: SomaHealthSnapshot,
     ) -> anyhow::Result<()> {
-        let ttl = Duration::from_millis(u64::from(snapshot.ttl_ms.max(1)));
+        let ttl_ns = u64::from(snapshot.ttl_ms.max(1)) * 1_000_000;
         snapshot.soma_ts_ns = unix_time_ns()?;
         snapshot.seq = self.next_sequence();
         let mut state = self.snapshot_state.write().await;
-        state.latest = Some(snapshot.clone());
-        state.primitive_valid_until = Some(Instant::now() + ttl);
+        // Clone before starting the TTL; commit only after the clock read succeeds.
+        let latest = snapshot.clone();
+        let deadline = robonix_chronos_clock::steady_time()?
+            .timestamp_ns
+            .checked_add(ttl_ns)
+            .ok_or_else(|| anyhow::anyhow!("Chronos steady deadline overflow"))?;
+        state.latest = Some(latest);
+        state.primitive_valid_until = Some(deadline);
         drop(state);
         let _ = self.snapshot_tx.send(snapshot);
         Ok(())
@@ -453,6 +457,7 @@ mod tests {
         robonix_system_soma_get_yaml_client::RobonixSystemSomaGetYamlClient,
         robonix_system_soma_get_yaml_server::RobonixSystemSomaGetYamlServer,
     };
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -559,6 +564,157 @@ mod tests {
             .expect("fallback snapshot");
         assert_eq!(fallback.seq, 2);
         assert_ne!(fallback.components[0].detail, "primitive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn primitive_deadline_keeps_boundaries_and_failed_reads_atomic() {
+        if std::env::var_os("SOMA_TEST_CLOCK_CHILD").is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let library = directory.path().join("clock_failure.so");
+            let compiled = std::process::Command::new("cc")
+                .args([
+                    "-shared", "-fPIC", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                ])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/clock_failure.c"
+                ))
+                .args(["-ldl", "-o"])
+                .arg(&library)
+                .status()
+                .unwrap();
+            assert!(compiled.success());
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::tests::primitive_deadline_keeps_boundaries_and_failed_reads_atomic",
+                    "--nocapture",
+                ])
+                .env("SOMA_TEST_CLOCK_CHILD", "1")
+                .env("LD_PRELOAD", library)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        // SAFETY: the child preloads the fixture defining this exact C signature.
+        let set_clock: unsafe extern "C" fn(i32, u64, nix::libc::c_long) = unsafe {
+            let symbol = nix::libc::dlsym(nix::libc::RTLD_DEFAULT, c"soma_test_clock".as_ptr());
+            assert!(!symbol.is_null());
+            std::mem::transmute(symbol)
+        };
+        let clock = |after, steady, offset| {
+            // SAFETY: the function changes only this test thread's fixture policy.
+            unsafe { set_clock(after, steady, offset) }
+        };
+        const START: u64 = 100_000_000_000;
+        let service = SomaService::new(fixture_body());
+        clock(0, START, 0);
+        let mut primitive = service.to_health_snapshot(0).await.unwrap();
+        primitive.ttl_ms = 0;
+        primitive.components[0].detail = "primitive".into();
+        service
+            .publish_primitive_snapshot(primitive.clone())
+            .await
+            .unwrap();
+        let first = service.snapshot_state.read().await.latest.clone().unwrap();
+        assert_eq!(first.ttl_ms, 0);
+        clock(0, START + 999_999, 0);
+        service.publish_runtime_snapshot().await.unwrap();
+        assert_eq!(
+            service.snapshot_state.read().await.latest,
+            Some(first.clone())
+        );
+        clock(0, START + 1_000_000, 0);
+        service.publish_runtime_snapshot().await.unwrap();
+        assert_ne!(service.snapshot_state.read().await.latest, Some(first));
+
+        primitive.ttl_ms = 20;
+        clock(0, START + 2_000_000, 0);
+        service
+            .publish_primitive_snapshot(primitive.clone())
+            .await
+            .unwrap();
+        clock(0, START + 21_000_000, 0);
+        service
+            .publish_primitive_snapshot(primitive.clone())
+            .await
+            .unwrap();
+        clock(0, START + 22_000_000, 86_400);
+        service.publish_runtime_snapshot().await.unwrap();
+        clock(0, START + 22_500_000, -86_400);
+        service.publish_runtime_snapshot().await.unwrap();
+        let state = service.snapshot_state.read().await;
+        let latest = state.latest.clone();
+        let deadline = state.primitive_valid_until;
+        assert_eq!(deadline, Some(START + 41_000_000));
+        assert_eq!(latest.as_ref().unwrap().components[0].detail, "primitive");
+        drop(state);
+
+        let mut updates = service.snapshot_tx.subscribe();
+        // Reference sampling reads monotonic twice; the lease read is the third.
+        clock(3, START + 23_000_000, 0);
+        assert!(
+            service
+                .publish_primitive_snapshot(primitive.clone())
+                .await
+                .is_err()
+        );
+        // Runtime snapshot reads reference plus sample age before checking the lease.
+        clock(4, START + 41_000_000, 0);
+        assert!(service.publish_runtime_snapshot().await.is_err());
+        let state = service.snapshot_state.read().await;
+        assert_eq!(state.latest, latest);
+        assert_eq!(state.primitive_valid_until, deadline);
+        assert!(matches!(
+            updates.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        drop(state);
+        clock(0, START + 41_000_000, 0);
+        service.publish_runtime_snapshot().await.unwrap();
+        assert_ne!(service.snapshot_state.read().await.latest, latest);
+
+        let state = service.snapshot_state.write().await;
+        let publication = service.publish_primitive_snapshot(primitive);
+        tokio::pin!(publication);
+        // Poll through reference sampling into the contended state lock.
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(publication.as_mut().poll(cx))).await,
+            std::task::Poll::Pending
+        ));
+        clock(0, START + 100_000_000, 0);
+        drop(state);
+        publication.await.unwrap();
+        assert_eq!(
+            service.snapshot_state.read().await.primitive_valid_until,
+            Some(START + 120_000_000)
+        );
+        let state = service.snapshot_state.read().await;
+        let latest = state.latest.clone();
+        let deadline = state.primitive_valid_until;
+        drop(state);
+        clock(0, u64::MAX, 0);
+        assert!(
+            service
+                .publish_primitive_snapshot(latest.clone().unwrap())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("deadline overflow")
+        );
+        let state = service.snapshot_state.read().await;
+        assert_eq!(state.latest, latest);
+        assert_eq!(state.primitive_valid_until, deadline);
+        drop(state);
+        clock(0, 0, 0);
     }
 
     #[tokio::test]

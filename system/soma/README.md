@@ -21,6 +21,12 @@ the reader-to-Soma delivery delay. Source timestamp fields retain their existing
 semantics. Clock errors fail publication without replacing the cached snapshot;
 the runtime publisher reports the failure and retries at its next interval.
 
+Health-primitive TTL uses Chronos steady time, starting after the snapshot is
+cloned under the state write lock. A zero TTL still means a 1 ms lease; at the
+deadline, the next runtime publication may replace the primitive snapshot. Failed clock
+reads retain the previous snapshot and lease without extending them. The
+500 ms runtime publication interval and Tokio scheduling are unchanged.
+
 The ROS 2 reader uses `robonix_chronos_clock.reference_timestamp_ns()` for
 `received_at_unix`, converted to float Unix seconds at each callback. It ignores
 ROS header timestamps. A failed clock read emits a warning and skips that sample;
