@@ -239,6 +239,14 @@ allow_x11_for_docker() {
 
 allow_x11_for_docker
 
+# Soma's reader and the primitive drivers share this Python environment.
+CLOCK_WHEELS="$SCRIPT_DIR/_chronos_wheels"
+mkdir -p "$CLOCK_WHEELS"
+rm -f "$CLOCK_WHEELS"/robonix_chronos_clock-*.whl
+uvx maturin build --release --locked \
+    --manifest-path "$REPO_ROOT/system/chronos/clock/Cargo.toml" \
+    --out "$CLOCK_WHEELS"
+
 # Bring sim up detached so we can layer rviz on top before tailing logs.
 DC=(docker compose --project-name "$ROBONIX_SIM_PROJECT" "${CF[@]}")
 "${DC[@]}" up --build -d

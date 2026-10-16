@@ -49,11 +49,26 @@ using the existing `ReferenceQuality` message. The reference publication
 interval is at most 100 real milliseconds, independent of a slower quality
 refresh setting. Motion duration checks still have sampling and transport
 latency; the stream never extrapolates paused time. Publication and process health
-continue on real time.
-Atlas heartbeat eviction and communication deadlines use real steady time.
-Simulated reference currently supports direct domains; affine
+continue on real time. Soma uses this stream when its deployment selects
+`ros_time`; other components retain their existing source until migrated.
+
+Scribe logs and Pilot transcripts use independent wall time. Atlas heartbeat
+eviction, Vitals process health and Tokio communication deadlines use real
+steady time. Simulated reference currently supports direct domains; affine
 device-clock fitting against `ros_time` is rejected during configuration.
 Restart the deployment to change the reference source.
+
+The reference stream sends a heartbeat at least once per real second,
+independently of the configured quality publication period. Verify this path
+with separate Atlas, Chronos and Soma processes from a sourced ROS environment:
+
+```bash
+cargo build -p robonix-atlas -p robonix-chronos -p robonix-soma
+python system/chronos/tests/simulation_reference.py
+```
+
+The Python environment needs `rclpy`, `nav_msgs`, `rosgraph_msgs`,
+`robonix-chronos-clock`, `grpcio`, `grpcio-tools` and `PyYAML`.
 
 ## Run the gRPC component
 

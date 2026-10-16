@@ -7,7 +7,7 @@ handler returns one of the following values:
 * :class:`Ok`: the handler succeeded and the framework advances state.
 * :class:`Err`: the handler failed and the provider enters ``ERROR``.
 * :class:`Deferred`: the handler cannot proceed and the provider remains in
-  its current state. Version 0.1 reports the reason but has no deferred queue.
+  its current state. Managed launchers retry INIT and ACTIVATE within their wait budget.
 
 Only ``on_init`` receives the decoded ``cfg`` dictionary. Raising an exception
 is converted defensively to :class:`Err`, but returning :class:`Err` explicitly
@@ -38,8 +38,8 @@ class Err:
 class Deferred:
     """Handler can't proceed yet — typically waiting for an upstream
     provider to come online, a sensor to publish first message, etc.
-    The provider stays in its current state; framework expects the operator
-    or eviction policy to retry later. `reason` is shown in
+    The provider stays in its current state; managed launchers retry INIT and ACTIVATE.
+    Other callers decide when to retry. `reason` is shown in
     `rbnx caps`."""
     reason: str
 

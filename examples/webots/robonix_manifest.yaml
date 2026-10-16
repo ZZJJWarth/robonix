@@ -26,6 +26,7 @@ system:
     runtime_reader_command:
       - docker
       - exec
+      - -i
       - robonix_tiago_sim
       - bash
       - -lc

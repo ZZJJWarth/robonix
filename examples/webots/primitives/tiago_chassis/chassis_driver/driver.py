@@ -23,13 +23,19 @@ from __future__ import annotations
 import json
 import math
 import os
-import time
+import threading
 
 from robonix_api import Primitive, Ok, Err, Deferred
+from robonix_api._reference_time import _ReferenceClock
 
 tiago_chassis = Primitive(id="tiago_chassis", namespace="robonix/primitive/chassis")
 
 cmd_vel_pub = None  # rclpy publisher to /cmd_vel; created in init()
+reference_clock = None
+init_config = None
+move_lock = threading.Lock()
+command_lock = threading.Lock()
+stopping = threading.Event()
 
 
 # ── gRPC RPC: `move` (no MCP — keep velocity primitive off the LLM tool list) ─
@@ -38,73 +44,100 @@ import std_msgs_pb2  # noqa: E402
 
 
 @tiago_chassis.grpc("robonix/primitive/chassis/move")
-def move(req: "chassis_pb2.ExecuteMoveCommand_Request") -> "chassis_pb2.ExecuteMoveCommand_Response":
-    """Velocity-mode chassis command. Service callers (simple_nav, nav2_wrapper,
-    teleop) reach this via gRPC. NOT exposed as MCP — the LLM should invoke
-    `service/navigation/navigate` instead, which handles obstacle avoidance.
-
-    Three modes by priority:
-      1. command.forward_m != 0   drive straight by signed distance (m)
-      2. command.rotate_deg != 0  in-place yaw rotation by signed degrees
-      3. velocity mode (linear_x/angular_z used directly for duration_sec)
-    """
-    if cmd_vel_pub is None:
+def move(req: "chassis_pb2.ExecuteMoveCommand_Request", context=None) -> "chassis_pb2.ExecuteMoveCommand_Response":
+    def response(data):
         return chassis_pb2.ExecuteMoveCommand_Response(
-            status=std_msgs_pb2.String(data=json.dumps({"error": "ROS2 not initialized"})),
+            status=std_msgs_pb2.String(data=json.dumps(data)),
         )
 
-    msg = req.command
-    speed_mps = float(os.environ.get("TIAGO_CHASSIS_SPEED_MPS", "0.3"))
-    ang_speed_rps = float(os.environ.get("TIAGO_CHASSIS_ANG_SPEED_RPS", "0.6"))
-    default_dur = float(os.environ.get("TIAGO_CHASSIS_CMD_DURATION_SEC", "1.0"))
+    if not move_lock.acquire(blocking=False):
+        return response({"error": "another chassis move is running"})
+    try:
+        return response(execute_move(req.command, context))
+    except (ValueError, RuntimeError) as exc:
+        return response({"error": str(exc)})
+    finally:
+        try:
+            from geometry_msgs.msg import Twist  # type: ignore
+            with command_lock:
+                if cmd_vel_pub is not None:
+                    cmd_vel_pub.publish(Twist())
+        finally:
+            move_lock.release()
 
+
+def execute_move(msg, context):
+    from geometry_msgs.msg import Twist  # type: ignore
+
+    clock = reference_clock
+    if cmd_vel_pub is None or clock is None or stopping.is_set():
+        raise RuntimeError("ROS2 not initialized or chassis stopped")
+    speed = float(os.environ.get("TIAGO_CHASSIS_SPEED_MPS", "0.3"))
+    angular_speed = float(os.environ.get("TIAGO_CHASSIS_ANG_SPEED_RPS", "0.6"))
+    default_duration = float(os.environ.get("TIAGO_CHASSIS_CMD_DURATION_SEC", "1.0"))
+    if any(not math.isfinite(x) or x <= 0 for x in (speed, angular_speed, default_duration)):
+        raise ValueError("chassis speed and default duration must be finite and positive")
     forward_m = float(getattr(msg, "forward_m", 0.0))
     rotate_deg = float(getattr(msg, "rotate_deg", 0.0))
     duration_sec = float(getattr(msg, "duration_sec", 0.0))
-
-    from geometry_msgs.msg import Twist  # type: ignore
+    if not all(math.isfinite(x) for x in (forward_m, rotate_deg, duration_sec)) or duration_sec < 0:
+        raise ValueError("chassis distances and duration must be finite; duration must be nonnegative")
     tw = Twist()
     if forward_m != 0.0:
-        sign = 1.0 if forward_m > 0 else -1.0
-        tw.linear.x = sign * speed_mps
-        duration = abs(forward_m) / speed_mps
+        tw.linear.x = math.copysign(speed, forward_m)
+        duration = abs(forward_m) / speed
         mode = "forward_m"
     elif rotate_deg != 0.0:
-        rad = math.radians(rotate_deg)
-        sign = 1.0 if rad > 0 else -1.0
-        tw.angular.z = sign * ang_speed_rps
-        duration = abs(rad) / ang_speed_rps
+        tw.angular.z = math.copysign(angular_speed, rotate_deg)
+        duration = abs(math.radians(rotate_deg)) / angular_speed
         mode = "rotate_deg"
     else:
-        tw.linear.x = float(msg.linear_x)
-        tw.linear.y = float(msg.linear_y)
-        tw.linear.z = float(msg.linear_z)
-        tw.angular.x = float(msg.angular_x)
-        tw.angular.y = float(msg.angular_y)
-        tw.angular.z = float(msg.angular_z)
-        duration = duration_sec if duration_sec > 0 else default_dur
+        for axis in ("linear", "angular"):
+            for component in ("x", "y", "z"):
+                value = float(getattr(msg, f"{axis}_{component}"))
+                if not math.isfinite(value):
+                    raise ValueError("chassis velocities must be finite")
+                setattr(getattr(tw, axis), component, value)
+        duration = duration_sec or default_duration
         mode = "velocity"
-
-    stop = Twist()
-    steps = max(1, int(duration / 0.1))
-    for _ in range(steps):
-        cmd_vel_pub.publish(tw)
-        time.sleep(0.1)
-    cmd_vel_pub.publish(stop)
-    return chassis_pb2.ExecuteMoveCommand_Response(
-        status=std_msgs_pb2.String(data=json.dumps({
-            "status": "done", "mode": mode,
-            "forward_m": forward_m, "rotate_deg": rotate_deg,
-            "duration_sec": duration,
-            "linear_x": tw.linear.x, "angular_z": tw.angular.z,
-        })),
-    )
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("chassis duration must be finite and positive")
+    start = clock.read()
+    if start is None:
+        raise RuntimeError("Chronos reference unavailable")
+    while True:
+        if stopping.is_set() or (context is not None and not context.is_active()):
+            raise RuntimeError("chassis move canceled")
+        current = clock.read()
+        if current is None or current[1:] != start[1:] or current[0] < start[0]:
+            raise RuntimeError("Chronos reference unavailable or reset during motion")
+        if (current[0] - start[0]) / 1e9 >= duration:
+            break
+        with command_lock:
+            if stopping.is_set() or cmd_vel_pub is None:
+                raise RuntimeError("chassis stopped")
+            cmd_vel_pub.publish(tw)
+        stopping.wait(0.1)
+    return {
+        "status": "done", "mode": mode,
+        "forward_m": forward_m, "rotate_deg": rotate_deg,
+        "duration_sec": duration,
+        "linear_x": tw.linear.x, "angular_z": tw.angular.z,
+    }
 
 
 # ── lifecycle ────────────────────────────────────────────────────────────────
 @tiago_chassis.on_init
 def init(cfg):
-    global cmd_vel_pub
+    global cmd_vel_pub, reference_clock, init_config
+    cfg = cfg or {}
+    if stopping.is_set():
+        return Err("chassis stopped; restart the primitive")
+    if init_config is not None:
+        if cfg != init_config:
+            return Err("chassis config changed while initialized; restart the primitive")
+        return finish_init()
+    reference_clock = _ReferenceClock(cfg.get("reference"), f"{tiago_chassis.id}/reference")
     odom_topic = cfg.get("odom_topic") or os.environ.get("TIAGO_ODOM_TOPIC", "/odom")
     twist_in_topic = cfg.get("twist_in_topic") or os.environ.get("TIAGO_CMD_VEL_TOPIC", "/cmd_vel")
 
@@ -116,20 +149,31 @@ def init(cfg):
     )
     tiago_chassis.declare_ros2_topic("robonix/primitive/chassis/twist_in", twist_in_topic, qos="reliable")
     tiago_chassis.declare_ros2_topic("robonix/primitive/chassis/odom",     odom_topic,     qos="reliable")
+    init_config = dict(cfg)
+    return finish_init()
+
+
+def finish_init():
+    if reference_clock.read() is None:
+        return Deferred("waiting for Chronos reference time")
     return Ok()
 
 
 @tiago_chassis.on_shutdown
 def shutdown():
     global cmd_vel_pub
-    if cmd_vel_pub is not None:
-        try:
-            from geometry_msgs.msg import Twist  # type: ignore
-            cmd_vel_pub.publish(Twist())
-        except Exception as exc:
-            print(f"[tiago_chassis] shutdown zero Twist failed: {exc}", flush=True)
-        finally:
-            cmd_vel_pub = None
+    stopping.set()
+    try:
+        from geometry_msgs.msg import Twist  # type: ignore
+        with command_lock:
+            try:
+                if cmd_vel_pub is not None:
+                    cmd_vel_pub.publish(Twist())
+            finally:
+                cmd_vel_pub = None
+    finally:
+        if reference_clock is not None:
+            reference_clock.close()
     return Ok()
 
 

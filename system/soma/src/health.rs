@@ -152,8 +152,15 @@ async fn consume_primitive_stream(
         while let Some(result) = stream.next().await {
             match result {
                 Ok(health_state) => {
-                    let snapshot = health_state_to_snapshot(&health_state, &body, 0);
-                    service.publish_primitive_snapshot(snapshot).await;
+                    let publication = match health_state_to_snapshot(&health_state, &body, 0) {
+                        Ok(snapshot) => service.publish_primitive_snapshot(snapshot).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = publication {
+                        robonix_scribe::error!(
+                            "[soma-health] rejected frame from '{provider_id}': {error:#}"
+                        );
+                    }
                 }
                 Err(error) => {
                     robonix_scribe::warn!(
@@ -177,8 +184,8 @@ fn health_state_to_snapshot(
     state: &crate::pb::health::HealthState,
     body: &SomaBody,
     seq: u64,
-) -> SomaHealthSnapshot {
-    let now_ns = chrono_now_ns();
+) -> Result<SomaHealthSnapshot> {
+    let now_ns = chrono_now_ns()?;
     let readings: HashMap<&str, &crate::pb::health::SensorReading> = state
         .readings
         .iter()
@@ -248,7 +255,7 @@ fn health_state_to_snapshot(
         };
     }
 
-    SomaHealthSnapshot {
+    Ok(SomaHealthSnapshot {
         schema_version: SCHEMA_VERSION,
         body_id: body.robot_id.clone(),
         seq,
@@ -272,7 +279,7 @@ fn health_state_to_snapshot(
         }],
         faults,
         metrics,
-    }
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -555,11 +562,15 @@ fn scalar(value: f64, unit: &str) -> Scalar {
     }
 }
 
-fn chrono_now_ns() -> i64 {
-    // Use a simple monotonic approach; avoids pulling in chrono just for this.
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    start.elapsed().as_nanos() as i64
+/// Preserve the existing health-source elapsed-time origin through Chronos steady reads.
+fn chrono_now_ns() -> Result<i64> {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let now = robonix_chronos_clock::steady_time()?.timestamp_ns;
+    let start = *START.get_or_init(|| now);
+    let elapsed = now
+        .checked_sub(start)
+        .ok_or_else(|| anyhow::anyhow!("Chronos steady time regressed"))?;
+    Ok(i64::try_from(elapsed)?)
 }
 
 #[cfg(test)]
@@ -612,7 +623,7 @@ mod tests {
             ],
         };
 
-        let snapshot = health_state_to_snapshot(&state, &webots_body(), 7);
+        let snapshot = health_state_to_snapshot(&state, &webots_body(), 7).unwrap();
         assert_eq!(snapshot.body_id, "tiago_webots");
         assert_eq!(snapshot.seq, 7);
         assert_eq!(snapshot.actuators.len(), 2);
@@ -666,7 +677,7 @@ mod tests {
             ],
         };
 
-        let snapshot = health_state_to_snapshot(&state, &webots_body(), 1);
+        let snapshot = health_state_to_snapshot(&state, &webots_body(), 1).unwrap();
         let wheel = snapshot
             .actuators
             .iter()

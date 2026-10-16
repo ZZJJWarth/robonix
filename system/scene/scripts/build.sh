@@ -90,6 +90,14 @@ echo "[build] rbnx codegen ${FLAGS[*]}"
 # scripts/start.sh with the exact interpreter and libraries baked into $IMG.
 rbnx codegen -p "$PKG" "${FLAGS[@]}"
 
+# Build for the host architecture; Docker and native targets run on that host.
+CLOCK_WHEELS="$PKG/docker/_chronos_wheels"
+mkdir -p "$CLOCK_WHEELS"
+rm -f "$CLOCK_WHEELS"/robonix_chronos_clock-*.whl
+uvx maturin build --release --locked \
+    --manifest-path "$REPO_ROOT/system/chronos/clock/Cargo.toml" \
+    --out "$CLOCK_WHEELS"
+
 # ── 1.5 Pre-fetch model weights onto host ──────────────────────────────────
 # Pulled out of the docker build because direct CDN connections from some
 # drop mid-stream on multi-hundred-MB transfers; an out-of-band download
@@ -243,6 +251,7 @@ if [[ "$TARGET" == "jetson-native" ]]; then
         exit 1
     }
     "$PY" -m pip install --user --upgrade pip --index-url "$PIP_IDX" || true
+    "$PY" -m pip install --user --no-deps "$CLOCK_WHEELS"/*.whl
     # torch & friends are already satisfied by the host stack, so pip skips
     # them; only the missing pure-python deps get installed.
     for req in scene-base scene-perception-core scene-perception-heavy; do

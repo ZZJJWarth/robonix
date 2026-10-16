@@ -9,6 +9,10 @@ this container at deploy time.
 
 ## Run
 
+The launcher requires Rust and `uvx`. It builds the Chronos Python clock wheel
+for the host architecture and installs it in the simulator image for Soma's
+reader and the primitive drivers.
+
 Start the sim **first**, then `rbnx boot` from `examples/webots/`:
 
 ```bash

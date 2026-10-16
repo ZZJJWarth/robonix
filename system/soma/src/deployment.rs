@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Deployment {
+    pub chronos_provider_id: Option<String>,
     pub deployment_path: PathBuf,
     pub manifest_path: PathBuf,
     pub primitives: Vec<PackageLaunchTarget>,
@@ -126,6 +127,14 @@ impl Deployment {
             .with_context(|| format!("prepare '{}'", manifest_path.display()))?;
         robonix_cli::manifest::validate_deployment_instance_names(&prepared)
             .with_context(|| format!("validate identities in '{}'", manifest_path.display()))?;
+        let chronos = &prepared["system"]["chronos"];
+        let chronos_provider_id =
+            (chronos["core"]["reference"]["kind"].as_str() == Some("ros_time")).then(|| {
+                chronos["provider_id"]
+                    .as_str()
+                    .unwrap_or("chronos")
+                    .to_owned()
+            });
         let manifest: DeployManifest = serde_yaml::from_value(prepared)
             .with_context(|| format!("decode '{}'", manifest_path.display()))?;
         let cache_root = deployment_path.join("rbnx-boot").join("cache");
@@ -164,6 +173,7 @@ impl Deployment {
             });
         }
         Ok(Self {
+            chronos_provider_id,
             deployment_path: deployment_path.to_path_buf(),
             manifest_path: manifest_path.to_path_buf(),
             primitives,

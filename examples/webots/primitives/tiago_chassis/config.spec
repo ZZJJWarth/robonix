@@ -11,3 +11,14 @@ config:
   # string absolute ROS 2 topic, default: /cmd_vel.
   # geometry_msgs/Twist command target used by chassis movement capabilities.
   twist_in_topic: /cmd_vel
+
+  # Inherited from the deployment's Chronos selection under managed startup.
+  # ros_time follows the Chronos reference stream; linux_system uses real
+  # steady elapsed time. provider_id defaults to chronos for ros_time.
+  reference:
+    kind: linux_system
+
+  # Launcher budget while waiting for the initial reference reading.
+  # Seconds in the selected reference; default 90 unless overridden by
+  # ROBONIX_DRIVER_INIT_TIMEOUT_S. Must be finite and positive.
+  sentinel_timeout_s: 90.0

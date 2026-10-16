@@ -41,6 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lifecycle_driver,
         selected_contracts.join("lifecycle_driver.v1.toml"),
     )?;
+    let reference_time = repo_root.join("capabilities/system/chronos/reference_time.v1.toml");
+    println!("cargo:rerun-if-changed={}", reference_time.display());
+    std::fs::copy(
+        reference_time,
+        selected_contracts.join("reference_time.v1.toml"),
+    )?;
     // The health collector consumes the primitive health contracts as a
     // client, so their stubs have to be generated here too.
     for name in ["state.v1.toml", "stream.v1.toml"] {

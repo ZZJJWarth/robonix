@@ -11,6 +11,7 @@ use robonix_atlas::{
     pb,
     service::{AtlasRegistry, serve_atlas},
 };
+use robonix_scribe::{Level, LogRecord};
 use tonic::Code;
 
 #[test]
@@ -53,6 +54,26 @@ fn clock_failures_preserve_state_and_log_evidence() {
         "{}\n{stderr}",
         String::from_utf8_lossy(&output.stdout)
     );
+    assert!(stderr.contains("clock failure message [Chronos time read failed:"));
+    assert!(stderr.contains("clock negative message [Chronos time read failed:"));
+    let records: Vec<LogRecord> = std::fs::read_to_string(logs.join("clock-test.log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        3,
+        "failed reads must not create file records"
+    );
+    assert_eq!(records[0].msg, "clock normal message");
+    assert!(
+        records[1]
+            .msg
+            .starts_with("clock quality message [Chronos wall clock unavailable:")
+    );
+    assert_eq!(records[2].msg, "clock recovered message");
+    assert!(records.iter().all(|record| record.ts > 0));
 }
 
 /// Control the test-only interposer; no host clock is changed.
@@ -120,6 +141,7 @@ async fn exercise() {
     };
     client.connect_capability(connection.clone()).await.unwrap();
     assert!(!robonix_chronos_clock::reference_time().unwrap().verified);
+    robonix_scribe::log(Level::Info, "clock-test", "clock normal message");
 
     for mode in [1, 2, 4] {
         let before = registry.inspect_json().await.unwrap();
@@ -157,6 +179,12 @@ async fn exercise() {
         );
         assert_eq!(registry.inspect_json().await.unwrap(), before);
         assert!(robonix_chronos_clock::steady_time().is_ok());
+        let message = match mode {
+            1 => "clock failure message",
+            2 => "clock negative message",
+            _ => "clock quality message",
+        };
+        robonix_scribe::log(Level::Info, "clock-test", message);
         clock_mode(0);
         client
             .heartbeat(pb::HeartbeatRequest {
@@ -186,6 +214,7 @@ async fn exercise() {
     let state: serde_json::Value =
         serde_json::from_str(&registry.inspect_json().await.unwrap()).unwrap();
     assert!(state["providers"][&request.id]["pushed_state"].is_null());
+    robonix_scribe::log(Level::Info, "clock-test", "clock recovered message");
     // Real expiry still removes channels, despite prior reference failures/steps.
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {

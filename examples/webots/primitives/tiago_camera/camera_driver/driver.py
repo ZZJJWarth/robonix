@@ -15,15 +15,13 @@ Owns `primitive/camera/*`. Subscribes to RGB + depth image topics, exposes:
   primitive/camera/depth_snapshot rpc        (MCP, depth as 8-bit JPEG)
   primitive/camera/driver         rpc        (gRPC lifecycle)
 
-Init waits up to 60 s for the first RGB frame — webots's image publisher is
-racy on cold boot (frames sometimes don't arrive for 20-40 s after rclpy
-spins up).
+Init returns Deferred until the first RGB frame arrives. The launcher owns
+the wait deadline in the deployment's selected time domain.
 """
 from __future__ import annotations
 
 import os
 import math
-import subprocess
 import threading
 import time
 from io import BytesIO
@@ -31,6 +29,7 @@ from io import BytesIO
 import numpy as np
 
 from robonix_api import Primitive, Ok, Err, Deferred
+from robonix_api._reference_time import _ReferenceClock
 
 tiago_camera = Primitive(id="tiago_camera", namespace="robonix/primitive/camera")
 
@@ -39,6 +38,8 @@ state_lock = threading.Lock()
 intrinsics_lock = threading.Lock()
 latest_rgb_jpeg: bytes | None = None
 latest_depth_jpeg: bytes | None = None
+latest_rgb_header = None
+latest_depth_header = None
 extrinsics_pub = None  # rclpy publisher for the latched TF
 intrinsics_pub = None  # rclpy publisher for the latched CameraInfo
 intrinsics_published = False  # true after the first valid K sample is published
@@ -50,6 +51,10 @@ latest_intrinsics_k: list[float] = []
 intrinsics_publish_interval_s = 0.5
 configured_intrinsics_logged = False
 last_intrinsics_publish = 0.0
+init_config: dict | None = None
+reference_clock = None
+stopping = threading.Event()
+workers: list[threading.Thread] = []
 
 # ── image conversion ─────────────────────────────────────────────────────────
 def ros_image_to_jpeg(msg) -> bytes:
@@ -89,20 +94,22 @@ def ros_image_to_jpeg(msg) -> bytes:
 
 
 def on_rgb(msg):
-    global latest_rgb_jpeg
+    global latest_rgb_jpeg, latest_rgb_header
     try:
         with state_lock:
             latest_rgb_jpeg = ros_image_to_jpeg(msg)
+            latest_rgb_header = (msg.header.stamp.sec, msg.header.stamp.nanosec, msg.header.frame_id)
         publish_intrinsics_if_needed("rgb")
     except Exception as e:
         print(f"[tiago_camera] RGB conversion error: {e}", flush=True)
 
 
 def on_depth(msg):
-    global latest_depth_jpeg
+    global latest_depth_jpeg, latest_depth_header
     try:
         with state_lock:
             latest_depth_jpeg = ros_image_to_jpeg(msg)
+            latest_depth_header = (msg.header.stamp.sec, msg.header.stamp.nanosec, msg.header.frame_id)
     except Exception as e:
         print(f"[tiago_camera] Depth conversion error: {e}", flush=True)
 
@@ -116,6 +123,8 @@ def publish_intrinsics_if_needed(reason: str, *, force: bool = False) -> None:
     fallback for simulators such as Webots that do not stream camera_info.
     """
     global configured_intrinsics_logged, intrinsics_published, last_intrinsics_publish
+    if stopping.is_set():
+        return
     pub = intrinsics_pub
     with intrinsics_lock:
         if pub is None:
@@ -163,22 +172,20 @@ from sensor_msgs_mcp import Image  # noqa: E402
 from std_msgs_mcp import Empty  # noqa: E402
 
 
-def now_header(frame_id: str) -> std_msgs_mcp.Header:
-    now = time.time()
-    sec = int(now)
-    ns = int((now % 1) * 1e9) % 1_000_000_000
+def image_header(source, fallback_frame: str) -> std_msgs_mcp.Header:
+    sec, ns, frame_id = source
     return std_msgs_mcp.Header(
-        stamp=builtin_interfaces_mcp.Time(sec=sec, nanosec=ns),
-        frame_id=frame_id,
+        stamp=builtin_interfaces_mcp.Time(sec=int(sec), nanosec=int(ns)),
+        frame_id=frame_id or fallback_frame,
     )
 
 
-def jpeg_to_image_mcp(jpg: bytes, frame_id: str) -> Image:
+def jpeg_to_image_mcp(jpg: bytes, header) -> Image:
     from PIL import Image as PILImage
     im = PILImage.open(BytesIO(jpg))
     w, h = im.size
     return Image(
-        header=now_header(frame_id),
+        header=header,
         height=h, width=w,
         encoding="jpeg",
         is_bigendian=0,
@@ -197,10 +204,11 @@ def snapshot(msg: Empty) -> Image:
     _ = msg
     with state_lock:
         data = latest_rgb_jpeg
+        source = latest_rgb_header
     if data is None:
         raise RuntimeError("no RGB image received yet")
     return jpeg_to_image_mcp(
-        data, os.environ.get("TIAGO_RGB_FRAME_ID", "head_front_camera_rgb_optical_frame")
+        data, image_header(source, os.environ.get("TIAGO_RGB_FRAME_ID", "head_front_camera_rgb_optical_frame"))
     )
 
 
@@ -213,10 +221,11 @@ def depth_snapshot(msg: Empty) -> Image:
     _ = msg
     with state_lock:
         data = latest_depth_jpeg
+        source = latest_depth_header
     if data is None:
         raise RuntimeError("no depth image received yet")
     return jpeg_to_image_mcp(
-        data, os.environ.get("TIAGO_DEPTH_FRAME_ID", "head_front_camera_depth_optical_frame")
+        data, image_header(source, os.environ.get("TIAGO_DEPTH_FRAME_ID", "head_front_camera_depth_optical_frame"))
     )
 
 
@@ -226,49 +235,52 @@ def publish_extrinsics_when_ready(base_frame: str, cam_frame: str, topic: str) -
     topic, exit. tf2 is used here purely as the local-to-this-primitive
     mechanism for reading the URDF chain — consumers never touch tf2; they
     go through the declared `primitive/camera/extrinsics` contract."""
-    from rclpy.duration import Duration  # type: ignore
     from rclpy.time import Time  # type: ignore
     from tf2_ros import Buffer, TransformListener  # type: ignore
     from robonix_api.ros import RosBackend
+
     node = RosBackend.get().node
     tf_buf = Buffer()
-    TransformListener(tf_buf, node)
-    deadline = time.monotonic() + 60.0
-    while time.monotonic() < deadline:
-        try:
-            tf = tf_buf.lookup_transform(base_frame, cam_frame, Time(), Duration(seconds=0.5))
-        except Exception:  # noqa: BLE001
-            time.sleep(0.5)
-            continue
-        tf.header.frame_id = base_frame
-        tf.child_frame_id = cam_frame
-        if extrinsics_pub is not None:
-            extrinsics_pub.publish(tf)
-        t = tf.transform.translation
-        print(f"[tiago_camera] published extrinsics {base_frame}→{cam_frame}: "
-              f"({t.x:.3f}, {t.y:.3f}, {t.z:.3f}) → {topic}")
-        return
-    print(f"[tiago_camera] WARN: extrinsics publish gave up — tf2 chain "
-          f"{base_frame}→{cam_frame} not resolvable.")
-
-
-def topic_has_sample(topic: str, timeout_s: float) -> bool:
-    """Return true if ROS CLI can read one sample from a topic.
-
-    This is a fallback for CI boots where the shared rclpy sentinel subscription
-    misses a callback even though Webots is already publishing frames.
-    """
-    timeout = max(1, int(timeout_s))
+    listener = TransformListener(tf_buf, node)
+    start = None
     try:
-        proc = subprocess.run(
-            ["timeout", str(timeout), "ros2", "topic", "echo", "--once", topic, "--field", "header"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        return False
-    return proc.returncode == 0
+        while not stopping.is_set():
+            reading = reference_clock.read()
+            if reading is None:
+                start = None
+                stopping.wait(0.1)
+                continue
+            if start is None or reading[1:] != start[1:]:
+                start = reading
+            if reading[0] - start[0] >= 60_000_000_000:
+                print(f"[tiago_camera] WARN: extrinsics publish gave up after 60 reference seconds: "
+                      f"tf2 chain {base_frame}→{cam_frame} not resolvable.", flush=True)
+                return
+            try:
+                tf = tf_buf.lookup_transform(base_frame, cam_frame, Time())
+            except Exception:  # noqa: BLE001
+                stopping.wait(0.5)
+                continue
+            tf.header.frame_id = base_frame
+            tf.child_frame_id = cam_frame
+            with state_lock:
+                if stopping.is_set():
+                    return
+                extrinsics_pub.publish(tf)
+            t = tf.transform.translation
+            print(f"[tiago_camera] published extrinsics {base_frame}→{cam_frame}: "
+                  f"({t.x:.3f}, {t.y:.3f}, {t.z:.3f}) → {topic}", flush=True)
+            return
+    except Exception as exc:
+        print(f"[tiago_camera] WARN: extrinsics worker failed: {exc}", flush=True)
+    finally:
+        listener.unregister()
+
+
+def start_worker(target, *args):
+    worker = threading.Thread(target=target, args=args, daemon=True)
+    workers.append(worker)
+    worker.start()
 
 
 def _cfg_float(cfg: dict, key: str, env_key: str, default: float = 0.0) -> float:
@@ -303,7 +315,15 @@ def init(cfg):
     global latest_intrinsics_msg, latest_intrinsics_k
     global intrinsics_publish_interval_s, configured_intrinsics_logged
     global last_intrinsics_publish
+    global init_config, reference_clock
     cfg = cfg or {}
+    if stopping.is_set():
+        return Err("camera stopped; restart the primitive")
+    if init_config is not None:
+        if cfg != init_config:
+            return Err("camera config changed while initialized; restart the primitive")
+        return finish_init(cfg)
+    reference_clock = _ReferenceClock(cfg.get("reference"), f"{tiago_camera.id}/reference")
     rgb_topic = cfg.get("rgb_topic") or os.environ.get(
         "TIAGO_RGB_TOPIC", "/head_front_camera/rgb/image_raw")
     depth_topic = cfg.get("depth_topic") or os.environ.get(
@@ -317,7 +337,6 @@ def init(cfg):
     base_frame = cfg.get("base_frame") or os.environ.get("TIAGO_BASE_FRAME", "base_link")
     cam_frame = cfg.get("cam_frame") or os.environ.get(
         "TIAGO_RGB_FRAME_ID", "head_front_camera_rgb_optical_frame")
-    sentinel_timeout = float(cfg.get("sentinel_timeout_s", 60.0))
     intrinsics_source_timeout_s = _cfg_float(
         cfg, "camera_info_source_timeout_s", "TIAGO_CAMERA_INFO_SOURCE_TIMEOUT_S", 1.0
     )
@@ -339,11 +358,7 @@ def init(cfg):
         "robonix/primitive/camera/extrinsics",
         topic=extrinsics_topic, msg_type=TransformStamped, qos="latched",
     )
-    threading.Thread(
-        target=publish_extrinsics_when_ready,
-        args=(base_frame, cam_frame, extrinsics_topic),
-        daemon=True,
-    ).start()
+    start_worker(publish_extrinsics_when_ready, base_frame, cam_frame, extrinsics_topic)
 
     # Intrinsics contract publisher. Prefer the camera's own CameraInfo stream
     # when present. Webots' Tiago camera plugin publishes images but not a
@@ -413,7 +428,7 @@ def init(cfg):
     def publish_intrinsics_loop() -> None:
         try:
             warned_missing = False
-            while True:
+            while not stopping.is_set():
                 publish_intrinsics_if_needed("timer", force=True)
                 with intrinsics_lock:
                     has_any_intrinsics = latest_intrinsics_msg is not None or configured_intrinsics_msg is not None
@@ -421,7 +436,8 @@ def init(cfg):
                 if not warned_missing and not has_any_intrinsics and not has_published:
                     # Keep the old delayed warning behavior so a wrong source
                     # topic is visible without racing normal startup.
-                    time.sleep(max(0.0, intrinsics_source_timeout_s))
+                    if stopping.wait(max(0.0, intrinsics_source_timeout_s)):
+                        return
                     with intrinsics_lock:
                         has_any_intrinsics = latest_intrinsics_msg is not None or configured_intrinsics_msg is not None
                         has_published = intrinsics_published
@@ -429,7 +445,7 @@ def init(cfg):
                         print("[tiago_camera] WARN: no usable CameraInfo source and no "
                               "configured camera intrinsics", flush=True)
                         warned_missing = True
-                time.sleep(max(0.1, intrinsics_publish_interval_s))
+                stopping.wait(max(0.1, intrinsics_publish_interval_s))
         except Exception as e:  # noqa: BLE001
             print(f"[tiago_camera] WARN: intrinsics publish thread exited: {e}", flush=True)
 
@@ -438,7 +454,7 @@ def init(cfg):
         topic=camera_info_topic, msg_type="CameraInfo",
         callback=on_camera_info, qos="best_effort", declare=False,
     )
-    threading.Thread(target=publish_intrinsics_loop, daemon=True).start()
+    start_worker(publish_intrinsics_loop)
 
     # Give-up watchdog: if no usable CameraInfo lands on `camera_info_topic`
     # the intrinsics contract is advertised but never publishes, and scene
@@ -449,36 +465,41 @@ def init(cfg):
         while time.monotonic() < end:
             if intrinsics_published:
                 return
-            time.sleep(0.5)
+            if stopping.wait(0.5):
+                return
         if not intrinsics_published:
             print(f"[tiago_camera] WARN: intrinsics never published — no "
                   f"usable CameraInfo seen on {source_topic}", flush=True)
 
-    threading.Thread(
-        target=warn_if_no_intrinsics,
-        args=(camera_info_topic,),
-        daemon=True,
-    ).start()
+    start_worker(warn_if_no_intrinsics, camera_info_topic)
 
-    # Gate INIT on first RGB arriving. Keep the in-process rclpy sentinel, but
-    # fall back to a short ROS CLI sample check so a missed transient callback
-    # does not leave CI stuck with an ERROR camera while Webots is publishing.
-    rclpy_wait_s = min(sentinel_timeout, 20.0)
-    if not tiago_camera.wait_for_topic(rgb_topic, "Image", rclpy_wait_s):
-        fallback_wait_s = max(1.0, min(30.0, sentinel_timeout - rclpy_wait_s))
-        if not topic_has_sample(rgb_topic, fallback_wait_s):
-            waited = rclpy_wait_s + fallback_wait_s
-            return Err(f"no RGB on {rgb_topic} within {waited:.1f}s")
-        print(f"[tiago_camera] RGB sample confirmed via ros2 CLI fallback on {rgb_topic}")
+    init_config = dict(cfg)
+    return finish_init(cfg)
 
-    # data interfaces are ready — declare them on atlas
-    tiago_camera.declare_ros2_topic("robonix/primitive/camera/rgb",   rgb_topic,   qos="best_effort")
+
+def finish_init(cfg):
+    rgb_topic = cfg.get("rgb_topic") or os.environ.get(
+        "TIAGO_RGB_TOPIC", "/head_front_camera/rgb/image_raw")
+    with state_lock:
+        if latest_rgb_jpeg is None:
+            return Deferred(f"waiting for first RGB frame on {rgb_topic}")
+    depth_topic = cfg.get("depth_topic") or os.environ.get(
+        "TIAGO_DEPTH_TOPIC", "/head_front_camera/depth_registered/image_raw")
+    tiago_camera.declare_ros2_topic("robonix/primitive/camera/rgb", rgb_topic, qos="best_effort")
     tiago_camera.declare_ros2_topic("robonix/primitive/camera/depth", depth_topic, qos="best_effort")
     return Ok()
 
 
 @tiago_camera.on_shutdown
 def shutdown():
+    with state_lock:
+        stopping.set()
+    for worker in workers:
+        worker.join(timeout=1.0)
+    if reference_clock is not None:
+        reference_clock.close()
+    if any(worker.is_alive() for worker in workers):
+        return Err("camera worker did not stop")
     return Ok()
 
 

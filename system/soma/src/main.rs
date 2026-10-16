@@ -232,6 +232,12 @@ async fn main() -> Result<()> {
     let config = SomaConfig::resolve(args).context("resolve Soma config")?;
     let deployment = Deployment::load_manifest(config.deployment_manifest())
         .context("load deployment manifest")?;
+    if deployment.chronos_provider_id.is_some() {
+        robonix_chronos_clock::configure_reference(robonix_chronos_clock::ReferenceConfig {
+            kind: robonix_chronos_clock::ReferenceSourceKind::RosTime,
+            ..Default::default()
+        })?;
+    }
     let body = Arc::new(SomaBody::load(&config.robot_yaml).context("load Soma YAML/URDF data")?);
 
     // Take the stage-trigger fd BEFORE we spawn any children. `rbnx`
@@ -273,7 +279,9 @@ async fn main() -> Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             tick.tick().await;
-            snapshot_service.publish_runtime_snapshot().await;
+            if let Err(error) = snapshot_service.publish_runtime_snapshot().await {
+                robonix_scribe::error!("[soma/state] snapshot publication failed: {error:#}");
+            }
         }
     });
     let (body_shutdown_tx, body_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -335,6 +343,13 @@ async fn main() -> Result<()> {
         .register_service(&config.provider_id, SOMA_NAMESPACE, "")
         .await
         .context("register Soma service")?;
+    let reference_subscription = deployment.chronos_provider_id.as_ref().map(|provider| {
+        robonix_soma::reference_time::ReferenceSubscription::start(
+            atlas.clone(),
+            config.provider_id.clone(),
+            provider.clone(),
+        )
+    });
     atlas
         .declare_capability(
             &config.provider_id,
@@ -555,10 +570,15 @@ async fn main() -> Result<()> {
     stage2_task.abort();
     let _ = stage2_task.await;
     snapshot_task.abort();
+    let reference_cleanup = match reference_subscription {
+        Some(subscription) => subscription.stop().await,
+        None => Ok(()),
+    };
     if let Some(runtime_monitor) = runtime_monitor {
         runtime_monitor.shutdown(&mut atlas).await;
     }
     stage2_launcher.lock().await.stop_all().await?;
+    reference_cleanup?;
     serve_result?;
     Ok(())
 }

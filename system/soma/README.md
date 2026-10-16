@@ -15,6 +15,70 @@ publishing the ROS runtime-state fallback.
 
 ## Config
 
+Soma uses Chronos wall time for Unix snapshot publication timestamps.
+Runtime sample freshness uses selected reference time from receipt in Soma,
+excluding the reader-to-Soma delivery delay. Source timestamp fields retain their
+existing semantics. Clock errors fail publication without replacing the cached snapshot;
+the runtime publisher reports the failure and retries at its next interval.
+
+Health-primitive TTL uses Chronos steady time, starting after the snapshot is
+cloned under the state write lock. A zero TTL still means a 1 ms lease; at the
+deadline, the next runtime publication may replace the primitive snapshot. Failed clock
+reads retain the previous snapshot and lease without extending them. The
+500 ms runtime publication interval and Tokio scheduling are unchanged.
+
+If the selected deployment has `system.chronos.core.reference.kind: ros_time`,
+Soma subscribes to that Chronos provider's `reference_time` stream through Atlas.
+Primitive initialization uses the shared launcher's `Deferred` retries. In ROS
+time deployments, first-frame wait budgets advance only with reference time.
+The CLI also uses reference time for the 180-second primitive and skill
+bring-up budgets. Process exit checks and individual Atlas calls retain real
+deadlines.
+Joint and odometry samples expire after two reference seconds, so simulation
+pauses do not age them. A new generation discards old runtime observations.
+Missing reference input or a disconnected stream fails reference reads without
+falling back to Linux time. Reference publication has a real heartbeat of at
+most 100 milliseconds, independently of the quality publication cadence. The
+subscription rejects a stream silent for five real seconds.
+The subscription retries on real time and releases its Atlas channel at shutdown.
+
+The ROS 2 reader uses `robonix_chronos_clock.wall_timestamp_ns()` for
+`received_at_unix`, converted to float Unix seconds at each callback. It ignores
+ROS header timestamps. A failed clock read emits a warning and skips that sample;
+cached samples keep their original freshness deadline. A missing binding prevents
+the reader from starting.
+
+Install `robonix-chronos-clock` into the Python environment running the reader,
+alongside `rclpy`, `sensor_msgs` and `nav_msgs`. From the repository root:
+
+```bash
+uvx maturin build --release --manifest-path system/chronos/clock/Cargo.toml --out /tmp/chronos-wheels
+uv venv --python /usr/bin/python3 --system-site-packages /tmp/soma-reader-venv
+uv pip install --python /tmp/soma-reader-venv/bin/python /tmp/chronos-wheels/*.whl
+```
+
+Source the ROS setup script and set `runtime_reader_command` to
+`["/tmp/soma-reader-venv/bin/python", "-u", "{script}", "{config}"]` in Soma's
+config. The interpreter must match the ROS Python version. For a container
+reader, install a compatible wheel inside that container; installing it on the
+host does not satisfy the reader's dependency. For the Webots simulator:
+
+```bash
+docker cp /tmp/chronos-wheels/robonix_chronos_clock-1.1.0b1-cp310-abi3-manylinux_2_34_x86_64.whl robonix_tiago_sim:/tmp/
+docker exec robonix_tiago_sim python3 -m pip install /tmp/robonix_chronos_clock-1.1.0b1-cp310-abi3-manylinux_2_34_x86_64.whl
+```
+
+Use the built wheel's actual filename and the simulator's container name. Repeat
+the install after recreating the container. Build the wheel for the reader's
+architecture and a compatible Linux baseline.
+
+Reader tests (with the binding installed):
+
+```bash
+/tmp/soma-reader-venv/bin/python system/soma/tests/test_runtime_ros.py
+cargo test -p robonix-soma --all-targets
+```
+
 Soma v2 uses a flat, four-key schema. Every field is required.
 
 ```yaml
@@ -380,3 +444,10 @@ description:
 | `can_do` | array | no |
 | `cannot_do` | array | no |
 | `notes` | array | no |
+
+The runtime reader exits when its stdin closes. Container commands must
+forward stdin with `docker exec -i`; shutdown closes it, waits on a real deadline
+and joins the output readers before releasing the owned Atlas channels.
+
+Shutdown stops the runtime reader and managed packages even if releasing the
+Chronos reference channel fails because Atlas is unavailable.

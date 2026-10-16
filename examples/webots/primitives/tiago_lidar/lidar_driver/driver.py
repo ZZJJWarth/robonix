@@ -21,12 +21,15 @@ tiago_lidar = Primitive(id="tiago_lidar", namespace="robonix/primitive/lidar")
 # ── shared state — the latest rclpy LaserScan we've seen ────────────────────
 state_lock = threading.Lock()
 latest_scan = None
+init_config = None
+stopped = False
 
 
 def on_scan(msg):
     global latest_scan
     with state_lock:
-        latest_scan = msg
+        if not stopped:
+            latest_scan = msg
 
 
 # ── MCP snapshot tool (typed against codegen MCP dataclasses) ──────────────
@@ -72,6 +75,14 @@ def snapshot(msg: Empty) -> LaserScan:
 # ── lifecycle ────────────────────────────────────────────────────────────────
 @tiago_lidar.on_init
 def init(cfg):
+    global init_config
+    cfg = cfg or {}
+    if stopped:
+        return Err("lidar stopped; restart the primitive")
+    if init_config is not None:
+        if cfg != init_config:
+            return Err("lidar config changed while initialized; restart the primitive")
+        return finish_init(cfg)
     topic = cfg.get("scan_topic") or os.environ.get("TIAGO_SCAN_TOPIC", "/scanner_normalized")
     tiago_lidar.create_subscription(
         "robonix/primitive/lidar/lidar",
@@ -79,14 +90,25 @@ def init(cfg):
         callback=on_scan, qos="best_effort",
         declare=False,  # we declare topic_out below (we own this contract)
     )
-    if not tiago_lidar.wait_for_topic(topic, "LaserScan", float(cfg.get("sentinel_timeout_s", 15.0))):
-        return Err(f"no LaserScan received on {topic} within timeout")
+    init_config = dict(cfg)
+    return finish_init(cfg)
+
+
+def finish_init(cfg):
+    topic = cfg.get("scan_topic") or os.environ.get("TIAGO_SCAN_TOPIC", "/scanner_normalized")
+    with state_lock:
+        if latest_scan is None:
+            return Deferred(f"waiting for first LaserScan on {topic}")
     tiago_lidar.declare_ros2_topic("robonix/primitive/lidar/lidar", topic, qos="best_effort")
     return Ok()
 
 
 @tiago_lidar.on_shutdown
 def shutdown():
+    global stopped, latest_scan
+    with state_lock:
+        stopped = True
+        latest_scan = None
     return Ok()
 
 

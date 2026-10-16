@@ -8,6 +8,8 @@ config:
   # sensor_msgs/LaserScan source exposed through the planar lidar capability.
   scan_topic: /scanner_normalized
 
-  # float seconds, default: 15.0; must be greater than zero.
-  # Maximum startup wait for the first LaserScan message before init fails.
-  sentinel_timeout_s: 15.0
+  # float seconds, default: 90.0; must be finite and greater than zero.
+  # Launcher budget for Deferred INIT: reference seconds with ros_time,
+  # real steady seconds otherwise. ROBONIX_DRIVER_INIT_TIMEOUT_S can override
+  # the launcher default when this key is absent.
+  sentinel_timeout_s: 90.0

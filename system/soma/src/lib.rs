@@ -5,6 +5,7 @@ pub mod deployment;
 pub mod health;
 pub mod launcher;
 pub mod pb;
+pub mod reference_time;
 pub mod report;
 pub mod runtime_monitor;
 pub mod runtime_state;

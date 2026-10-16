@@ -34,8 +34,7 @@ use robonix_atlas::client::AtlasClient;
 use robonix_atlas::pb as atlas_pb;
 use robonix_cli::launch::{
     PackageRuntimeRecord, ProviderRegistrationSnapshot, RegistrationOutcome,
-    contract_id_to_service_name, resolve_runtime_driver_contract, snapshot_provider_ids,
-    terminate_process_group,
+    resolve_runtime_driver_contract, snapshot_provider_ids, terminate_process_group,
 };
 use robonix_cli::output;
 use serde::Deserialize;
@@ -48,42 +47,22 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
-use tonic::Request;
 use tonic::transport::Endpoint;
 use uuid::Uuid;
 
 use robonix_scribe as scribe;
-
-use crate::pb::lifecycle::{DriverRequest, DriverResponse};
 
 use super::teardown;
 
 // Driver.srv command discriminators (mirrors lifecycle/srv/Driver.srv).
 const CMD_INIT: u32 = 0;
 const CMD_ACTIVATE: u32 = 1;
-#[allow(dead_code)]
-const CMD_DEACTIVATE: u32 = 2;
-#[allow(dead_code)]
-const CMD_SHUTDOWN: u32 = 3;
 // How long to wait for a freshly spawned package to register its driver
 // capability with atlas before giving up.
 const DRIVER_REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
-// Default Driver(CMD_INIT) deadline. Webots CI can override this with
-// ROBONIX_DRIVER_INIT_TIMEOUT_S for real stacks whose lifecycle bringup may
-// exceed 90s on a cold self-hosted runner.
-const DEFAULT_DRIVER_INIT_TIMEOUT: Duration = Duration::from_secs(90);
 const DEPLOY_CONSUMER_ID: &str = "rbnx-cli/deploy";
 
 pub(super) use robonix_cli::manifest::is_builtin_system;
-
-fn driver_init_timeout() -> Duration {
-    std::env::var("ROBONIX_DRIVER_INIT_TIMEOUT_S")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_DRIVER_INIT_TIMEOUT)
-}
 
 // ── Deploy manifest schema (subset used by this orchestrator) ───────────
 
@@ -99,6 +78,15 @@ struct DeployManifest {
     service: Vec<PackageEntry>,
     #[serde(default)]
     skill: Vec<PackageEntry>,
+}
+
+impl DeployManifest {
+    fn reference_provider(&self) -> Option<&str> {
+        self.system
+            .get("chronos")
+            .filter(|config| config["core"]["reference"]["kind"].as_str() == Some("ros_time"))
+            .map(|config| config["provider_id"].as_str().unwrap_or("chronos"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +166,60 @@ fn resolve_entry_path(
 mod tests {
 
     use super::*;
+
+    #[tokio::test]
+    async fn soma_readiness_reports_broken_endpoint_and_releases_channel() {
+        const SOMA_GET_YAML_CONTRACT: &str = "robonix/system/soma/get_yaml";
+        use robonix_atlas::{
+            client,
+            service::{AtlasRegistry, serve_atlas},
+        };
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let registry = Arc::new(AtlasRegistry::default());
+        let server = tokio::spawn(serve_atlas(registry.clone(), address));
+        let mut atlas =
+            AtlasClient::connect_with_retry(address.to_string(), 50, Duration::from_millis(10))
+                .await
+                .unwrap();
+        atlas
+            .register_service("soma", "robonix/system/soma", "")
+            .await
+            .unwrap();
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = unavailable.local_addr().unwrap().to_string();
+        drop(unavailable);
+        atlas
+            .declare_capability(
+                "soma",
+                SOMA_GET_YAML_CONTRACT,
+                atlas_pb::Transport::Grpc,
+                &endpoint,
+                client::grpc_params(
+                    "capabilities/system/soma/get_yaml.v1.toml",
+                    "robonix.contracts.RobonixSystemSomaGetYaml",
+                    "/robonix.contracts.RobonixSystemSomaGetYaml/GetYaml",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            soma_grpc_ready(&mut atlas, SOMA_GET_YAML_CONTRACT),
+        )
+        .await
+        .expect("readiness must retain a real deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("Soma readiness gRPC endpoint"));
+        let inspected: serde_json::Value =
+            serde_json::from_str(&registry.inspect_json().await.unwrap()).unwrap();
+        assert!(inspected["channels"].as_object().unwrap().is_empty());
+        server.abort();
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = std::process::Command::new("git")
@@ -1702,6 +1744,7 @@ pub async fn execute(
                             .collect::<Vec<_>>(),
                         soma_child,
                         &log_dir,
+                        deploy.reference_provider(),
                     )
                     .await?;
 
@@ -1875,14 +1918,23 @@ pub async fn execute(
                     "soma".to_string(),
                     format!("start skill packages: {e:#}"),
                 ));
-            } else if let Err(e) = wait_for_soma_skills(
-                &mut atlas,
-                &deploy
-                    .skill
-                    .iter()
-                    .map(|entry| entry.name.clone())
-                    .collect::<Vec<_>>(),
-            )
+            } else if let Err(e) = async {
+                let soma = children
+                    .iter_mut()
+                    .find(|child| child.name == "soma")
+                    .context("Soma process was not started")?;
+                wait_for_soma_skills(
+                    &mut atlas,
+                    &deploy
+                        .skill
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>(),
+                    &mut soma.child,
+                    deploy.reference_provider(),
+                )
+                .await
+            }
             .await
             {
                 failures.push(("skill".to_string(), "soma".to_string(), format!("{e:#}")));
@@ -2611,6 +2663,7 @@ async fn wait_for_soma_stage1(
     primitive_names: &[String],
     soma_child: &mut Child,
     log_dir: &Path,
+    reference_provider: Option<&str>,
 ) -> Result<()> {
     const SPINNER_TICK: Duration = Duration::from_millis(100);
     const POLLS_PER_TICK: usize = 5; // poll atlas every 500 ms
@@ -2618,7 +2671,13 @@ async fn wait_for_soma_stage1(
     const SOMA_GET_YAML_CONTRACT: &str = "robonix/system/soma/get_yaml";
 
     let started = Instant::now();
-    let deadline = started + SOMA_STAGE1_TIMEOUT;
+    let mut reference = match reference_provider {
+        Some(provider) => Some(
+            robonix_cli::launch::ReferenceWait::connect(atlas, "rbnx-cli/deploy/soma", provider)
+                .await?,
+        ),
+        None => None,
+    };
     let mut frame: usize = 0;
     let mut observed_states: HashMap<String, i32> = HashMap::new();
     let mut active_primitives: HashSet<String> = HashSet::new();
@@ -2627,6 +2686,10 @@ async fn wait_for_soma_stage1(
         output::boot_wait("primitive", "waiting for Soma-managed providers");
     }
     loop {
+        let elapsed = match reference.as_mut() {
+            Some(wait) => wait.tick().await?,
+            None => started.elapsed(),
+        };
         let elapsed_s = started.elapsed().as_secs_f32();
         let detail = if primitive_names.is_empty() {
             format!("waiting for Soma gRPC readiness… {elapsed_s:>4.1}s")
@@ -2706,10 +2769,13 @@ async fn wait_for_soma_stage1(
         }
         if frame.is_multiple_of(POLLS_PER_TICK) {
             for name in primitive_names {
-                let providers = atlas
-                    .query_capabilities(name, "", atlas_pb::Transport::Unspecified)
-                    .await
-                    .with_context(|| format!("poll primitive '{name}' during Soma bring-up"))?;
+                let providers = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    atlas.query_capabilities(name, "", atlas_pb::Transport::Unspecified),
+                )
+                .await
+                .context("primitive readiness query timed out")?
+                .with_context(|| format!("poll primitive '{name}' during Soma bring-up"))?;
                 let Some(provider) = providers.into_iter().find(|provider| provider.id == *name)
                 else {
                     continue;
@@ -2733,23 +2799,29 @@ async fn wait_for_soma_stage1(
                     }
                 }
             }
-            let providers = atlas
-                .query_capabilities("soma", SOMA_GET_YAML_CONTRACT, atlas_pb::Transport::Grpc)
-                .await
-                .context("wait for Soma primitive readiness")?;
+            let providers = tokio::time::timeout(
+                Duration::from_secs(2),
+                atlas.query_capabilities("soma", SOMA_GET_YAML_CONTRACT, atlas_pb::Transport::Grpc),
+            )
+            .await
+            .context("Soma readiness query timed out")?
+            .context("wait for Soma primitive readiness")?;
             if let Some(soma) = providers.into_iter().find(|p| p.id == "soma")
                 && soma.state == atlas_pb::LifecycleState::StateActive as i32
-                && soma_grpc_ready(atlas, SOMA_GET_YAML_CONTRACT).await
             {
+                soma_grpc_ready(atlas, SOMA_GET_YAML_CONTRACT).await?;
                 for name in primitive_names {
                     if !active_primitives.contains(name) {
                         output::boot_ok(name, "ACTIVE");
                     }
                 }
+                if let Some(wait) = reference.as_mut() {
+                    wait.close().await?;
+                }
                 return Ok(());
             }
         }
-        if Instant::now() >= deadline {
+        if elapsed >= SOMA_STAGE1_TIMEOUT {
             output::boot_fail(
                 "primitive",
                 &format!(
@@ -2783,58 +2855,101 @@ fn lifecycle_state_label(state: i32) -> &'static str {
     }
 }
 
-async fn wait_for_soma_skills(atlas: &mut AtlasClient, skill_names: &[String]) -> Result<()> {
+async fn wait_for_soma_skills(
+    atlas: &mut AtlasClient,
+    skill_names: &[String],
+    soma_child: &mut Child,
+    reference_provider: Option<&str>,
+) -> Result<()> {
     const TIMEOUT: Duration = Duration::from_secs(180);
     if skill_names.is_empty() {
         return Ok(());
     }
-    let deadline = Instant::now() + TIMEOUT;
-    let mut observed_states: HashMap<String, i32> = HashMap::new();
-    let mut ready: HashSet<String> = HashSet::new();
-    while Instant::now() < deadline {
-        for name in skill_names {
-            let providers = atlas
-                .query_capabilities(name, "", atlas_pb::Transport::Unspecified)
-                .await
-                .with_context(|| format!("poll skill '{name}' during soma bring-up"))?;
-            let Some(provider) = providers.into_iter().find(|provider| provider.id == *name) else {
-                continue;
+    let started = Instant::now();
+    let mut reference = match reference_provider {
+        Some(provider) => Some(
+            robonix_cli::launch::ReferenceWait::connect(
+                atlas,
+                "rbnx-cli/deploy/soma-skills",
+                provider,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let result = async {
+        let mut observed_states: HashMap<String, i32> = HashMap::new();
+        let mut ready: HashSet<String> = HashSet::new();
+        loop {
+            if let Some(status) = soma_child.try_wait().context("check Soma process")? {
+                anyhow::bail!("Soma exited with {status:?} during skill bring-up; see soma.log");
+            }
+            let elapsed = match reference.as_mut() {
+                Some(wait) => wait.tick().await?,
+                None => started.elapsed(),
             };
-            if observed_states.insert(name.clone(), provider.state) != Some(provider.state) {
-                let state = lifecycle_state_label(provider.state);
-                if provider.state == atlas_pb::LifecycleState::StateInactive as i32
-                    || provider.state == atlas_pb::LifecycleState::StateActive as i32
-                {
-                    output::boot_ok(name, state);
+            for name in skill_names {
+                let providers = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    atlas.query_capabilities(name, "", atlas_pb::Transport::Unspecified),
+                )
+                .await
+                .with_context(|| format!("skill '{name}' readiness query timed out"))?
+                .with_context(|| format!("poll skill '{name}' during soma bring-up"))?;
+                let Some(provider) = providers.into_iter().find(|provider| provider.id == *name)
+                else {
+                    ready.remove(name);
+                    continue;
+                };
+                let is_ready = provider.state == atlas_pb::LifecycleState::StateInactive as i32
+                    || provider.state == atlas_pb::LifecycleState::StateActive as i32;
+                if is_ready {
                     ready.insert(name.clone());
-                } else if provider.state == atlas_pb::LifecycleState::StateError as i32 {
-                    output::boot_fail(name, "ERROR; see soma.log and provider log");
-                    anyhow::bail!("skill '{name}' entered ERROR during Soma bring-up");
-                } else if output::boot_verbose() {
-                    output::boot_note(name, state);
+                } else {
+                    ready.remove(name);
+                }
+                if observed_states.insert(name.clone(), provider.state) != Some(provider.state) {
+                    let state = lifecycle_state_label(provider.state);
+                    if is_ready {
+                        output::boot_ok(name, state);
+                    } else if provider.state == atlas_pb::LifecycleState::StateError as i32 {
+                        output::boot_fail(name, "ERROR; see soma.log and provider log");
+                        anyhow::bail!("skill '{name}' entered ERROR during Soma bring-up");
+                    } else if output::boot_verbose() {
+                        output::boot_note(name, state);
+                    }
                 }
             }
+            if ready.len() == skill_names.len() {
+                return Ok(());
+            }
+            if elapsed >= TIMEOUT {
+                let pending = skill_names
+                    .iter()
+                    .filter(|name| !ready.contains(*name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for name in &pending {
+                    output::boot_fail(
+                        name,
+                        "registration/INIT timeout; see soma.log and provider log",
+                    );
+                }
+                anyhow::bail!(
+                    "Soma skill bring-up timed out after {TIMEOUT:?}: {}",
+                    pending.join(", ")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if ready.len() == skill_names.len() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let pending = skill_names
-        .iter()
-        .filter(|name| !ready.contains(*name))
-        .cloned()
-        .collect::<Vec<_>>();
-    for name in &pending {
-        output::boot_fail(
-            name,
-            "registration/INIT timeout; see soma.log and provider log",
-        );
-    }
-    anyhow::bail!(
-        "Soma skill bring-up timed out after {TIMEOUT:?}: {}",
-        pending.join(", ")
-    )
+    .await;
+    let cleanup = match reference.as_mut() {
+        Some(wait) => wait.close().await,
+        None => Ok(()),
+    };
+    result?;
+    cleanup.context("release Soma skill reference channels")
 }
 
 /// Read the last `max_lines` lines of a file for embedding into an
@@ -2902,30 +3017,40 @@ fn read_provider_exit_summary(path: &Path) -> Option<String> {
     None
 }
 
-async fn soma_grpc_ready(atlas: &mut AtlasClient, contract_id: &str) -> bool {
-    let Ok((channel_id, endpoint, _params)) = atlas
-        .connect_capability(
+async fn soma_grpc_ready(atlas: &mut AtlasClient, contract_id: &str) -> Result<()> {
+    let (channel_id, endpoint, _params) = tokio::time::timeout(
+        Duration::from_secs(2),
+        atlas.connect_capability(
             DEPLOY_CONSUMER_ID,
             "soma",
             contract_id,
             atlas_pb::Transport::Grpc,
-        )
-        .await
-    else {
-        return false;
-    };
+        ),
+    )
+    .await
+    .context("Soma readiness Atlas connection timed out")?
+    .context("connect Soma readiness capability")?;
     let normalized = if endpoint.starts_with("http") {
         endpoint
     } else {
         format!("http://{endpoint}")
     };
-    let ready = match Endpoint::new(normalized.clone()) {
-        Ok(endpoint) => tokio::time::timeout(Duration::from_secs(1), endpoint.connect())
+    let ready = async {
+        let endpoint = Endpoint::new(normalized).context("invalid Soma readiness endpoint")?;
+        tokio::time::timeout(Duration::from_secs(2), endpoint.connect())
             .await
-            .is_ok_and(|r| r.is_ok()),
-        Err(_) => false,
-    };
-    let _ = atlas.disconnect_capability(&channel_id).await;
+            .context("Soma readiness gRPC connection timed out")?
+            .context("connect Soma readiness gRPC endpoint")?;
+        Ok(())
+    }
+    .await;
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(2),
+        atlas.disconnect_capability(&channel_id),
+    )
+    .await
+    .context("Soma readiness Atlas disconnect timed out")?;
+    cleanup.context("disconnect Soma readiness capability")?;
     ready
 }
 
@@ -2958,11 +3083,7 @@ fn write_stage2_trigger(writer: &mut Option<std::fs::File>) -> Result<()> {
     Ok(())
 }
 
-/// Issue one Driver(cmd) RPC against a freshly-connected channel, then
-/// release the channel. Returns the response's `state` string on success;
-/// bail-errors when ok=false or the RPC itself fails. Used by the boot
-/// path for both CMD_INIT and CMD_ACTIVATE, with identical timeout / channel
-/// hygiene.
+/// Use the shared lifecycle wait and channel cleanup for directly launched packages.
 async fn call_driver_cmd(
     atlas: &mut AtlasClient,
     provider_id: &str,
@@ -2972,77 +3093,15 @@ async fn call_driver_cmd(
     cmd: u32,
     config_json: String,
 ) -> Result<String> {
-    let cmd_name = match cmd {
-        CMD_INIT => "INIT",
-        CMD_ACTIVATE => "ACTIVATE",
-        CMD_DEACTIVATE => "DEACTIVATE",
-        CMD_SHUTDOWN => "SHUTDOWN",
-        _ => "?",
-    };
-    let (channel_id, endpoint, _params) = atlas
-        .connect_capability(
-            DEPLOY_CONSUMER_ID,
-            provider_id,
-            driver_contract,
-            atlas_pb::Transport::Grpc,
-        )
-        .await
-        .with_context(|| {
-            format!("[{component}/{pkg_label}] ConnectCapability for {driver_contract}")
-        })?;
-    let normalized = if endpoint.starts_with("http") {
-        endpoint
-    } else {
-        format!("http://{endpoint}")
-    };
-    let result = async {
-        let driver_timeout = driver_init_timeout();
-        let channel = Endpoint::new(normalized.clone())
-            .with_context(|| format!("invalid driver endpoint '{normalized}'"))?
-            .connect()
-            .await
-            .with_context(|| format!("dial driver at '{normalized}'"))?;
-        let svc_name = contract_id_to_service_name(driver_contract);
-        let path: tonic::codegen::http::uri::PathAndQuery =
-            format!("/robonix.contracts.{svc_name}/Driver")
-                .parse()
-                .with_context(|| format!("build gRPC path for '{driver_contract}'"))?;
-        let mut grpc = tonic::client::Grpc::new(channel);
-        grpc.ready().await.with_context(|| "gRPC ready")?;
-        let codec: tonic_prost::ProstCodec<DriverRequest, DriverResponse> = Default::default();
-        let resp = tokio::time::timeout(
-            driver_timeout,
-            grpc.unary(
-                Request::new(DriverRequest {
-                    command: cmd,
-                    config_json,
-                }),
-                path,
-                codec,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Driver(CMD_{cmd_name}) timed out after {}s",
-                driver_timeout.as_secs()
-            )
-        })?
-        .with_context(|| format!("Driver(CMD_{cmd_name}) RPC failed"))?;
-        Ok::<_, anyhow::Error>(resp.into_inner())
-    }
-    .await;
-    let _ = atlas.disconnect_capability(&channel_id).await;
-    let r = result
-        .map_err(|e| anyhow::anyhow!("[{component}/{pkg_label}] Driver(CMD_{cmd_name}): {e:#}"))?;
-    if !r.ok {
-        anyhow::bail!(
-            "[{component}/{pkg_label}] Driver(CMD_{cmd_name}) returned ok=false (state={}, error={})",
-            r.state,
-            r.error
-        );
-    }
-    Ok(r.state)
+    robonix_cli::launch::call_driver_cmd(
+        atlas,
+        provider_id,
+        driver_contract,
+        cmd,
+        config_json,
+        &format!("{component}/{pkg_label}"),
+    )
+    .await
 }
 
 /// Strip the leading `<component>_` from the boot-log pkg_label.

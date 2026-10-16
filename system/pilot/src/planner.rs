@@ -847,12 +847,12 @@ async fn compact_history(
     cache_epoch: u64,
     transcript: &mut Transcript,
     task: Option<&TaskState>,
-) -> bool {
+) -> Result<bool> {
     let Some(room) = budget.room(non_history_tokens) else {
-        return false;
+        return Ok(false);
     };
     if !budget.must_compact(history, non_history_tokens) {
-        return false;
+        return Ok(false);
     }
     let before_messages = history.len();
     let before_tokens: usize = history.iter().map(history::tokens).sum();
@@ -903,12 +903,12 @@ async fn compact_history(
     let evicted = plan.evicted.len();
     let pinned = plan.pinned.len();
     // The evicted messages leave history here; make sure they are archived.
-    transcript.record(history, task);
+    transcript.record(history, task)?;
     *history = std::iter::once(summary)
         .chain(plan.pinned)
         .chain(plan.tail)
         .collect();
-    transcript.record_compaction(history, evicted, pinned, summarized);
+    transcript.record_compaction(history, evicted, pinned, summarized)?;
     let after_tokens: usize = history.iter().map(history::tokens).sum();
     info!(
         "[pilot/compaction] {}",
@@ -932,7 +932,7 @@ async fn compact_history(
             "summary_output_tokens": completion.as_ref().and_then(|c| c.usage.as_ref()).map(|u| u.completion_tokens),
         })
     );
-    true
+    Ok(true)
 }
 
 struct VlmTextCompletion {
@@ -1062,6 +1062,19 @@ pub async fn run_turn(
         }};
     }
 
+    // A strict archival failure must cancel execution before abandoning supervision.
+    macro_rules! clock_result {
+        ($result:expr, $forest:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    cancel_forest_plans(executor, $forest, &session_id).await;
+                    return Err(error.into());
+                }
+            }
+        };
+    }
+
     if task_is_session_end(task) {
         info!("[pilot] session_end: invoking compact_memory if available");
         memory::try_compact(executor, atlas, consumer_id).await;
@@ -1181,7 +1194,7 @@ pub async fn run_turn(
 
     'supervisor: loop {
         // Archive what the last iteration added, before anything can compact it.
-        transcript.record(history, standing_task.as_ref());
+        clock_result!(transcript.record(history, standing_task.as_ref()), &forest);
         // Check for hard interrupt at the top of every iteration.
         if *cancel_rx.borrow() {
             return_interrupted!(&forest);
@@ -1350,7 +1363,7 @@ pub async fn run_turn(
         // Pull any steers that landed while we were busy (e.g. during the
         // previous VLM stream) so this round plans with the latest user input.
         drain_steers(&mut steer_rx, history, standing_task);
-        transcript.record(history, standing_task.as_ref());
+        clock_result!(transcript.record(history, standing_task.as_ref()), &forest);
 
         // Re-discover capabilities from atlas every round so providers that
         // registered mid-turn are visible in the next call.
@@ -1406,17 +1419,19 @@ pub async fn run_turn(
         .iter()
         .map(|content| content.len().div_ceil(4))
         .sum();
-        if compact_history(
-            history,
-            vlm,
-            history_budget,
-            compaction_non_history_tokens,
-            cache_epoch,
-            transcript,
-            standing_task.as_ref(),
-        )
-        .await
-        {
+        if clock_result!(
+            compact_history(
+                history,
+                vlm,
+                history_budget,
+                compaction_non_history_tokens,
+                cache_epoch,
+                transcript,
+                standing_task.as_ref(),
+            )
+            .await,
+            &forest
+        ) {
             cache_epoch = cache_epoch.saturating_add(1);
             // The summary may have absorbed the last full snapshots; show
             // them again rather than send changes against a missing baseline.

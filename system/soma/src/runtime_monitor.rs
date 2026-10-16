@@ -25,6 +25,7 @@ struct Source {
 
 pub struct RuntimeMonitor {
     child: Child,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     channel_ids: Vec<String>,
 }
 
@@ -107,6 +108,7 @@ pub async fn start(
         }
     };
     let mut child = match command
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -122,7 +124,7 @@ pub async fn start(
     let stdout = match child.stdout.take().context("capture runtime reader stdout") {
         Ok(stdout) => stdout,
         Err(error) => {
-            let _ = child.kill().await;
+            stop_reader(&mut child).await;
             disconnect_channels(atlas, &channel_ids).await;
             return Err(error);
         }
@@ -130,7 +132,7 @@ pub async fn start(
     let stderr = match child.stderr.take().context("capture runtime reader stderr") {
         Ok(stderr) => stderr,
         Err(error) => {
-            let _ = child.kill().await;
+            stop_reader(&mut child).await;
             disconnect_channels(atlas, &channel_ids).await;
             return Err(error);
         }
@@ -157,13 +159,13 @@ pub async fn start(
     let (startup_line, subscriptions) = match readiness {
         Ok(readiness) => readiness,
         Err(error) => {
-            let _ = child.kill().await;
+            stop_reader(&mut child).await;
             disconnect_channels(atlas, &channel_ids).await;
             return Err(error);
         }
     };
     state.apply_line(&startup_line).await?;
-    tokio::spawn({
+    let stdout_task = tokio::spawn({
         let state = state.clone();
         async move {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -173,14 +175,18 @@ pub async fn start(
             }
         }
     });
-    tokio::spawn(async move {
+    let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             warn!("[soma/state/ros] {line}");
         }
     });
     info!("[soma/state] runtime reader ready with {subscriptions} subscription(s)");
-    Ok(Some(RuntimeMonitor { child, channel_ids }))
+    Ok(Some(RuntimeMonitor {
+        child,
+        tasks: vec![stdout_task, stderr_task],
+        channel_ids,
+    }))
 }
 
 async fn disconnect_channels(atlas: &mut AtlasClient, channel_ids: &[String]) {
@@ -210,9 +216,26 @@ fn build_command(template: &[String], script: &Path, config: &Path) -> Result<Co
     Ok(command)
 }
 
+async fn stop_reader(child: &mut Child) {
+    drop(child.stdin.take());
+    match timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!("[soma/state] wait for runtime reader: {error}"),
+        Err(_) => {
+            if let Err(error) = child.kill().await {
+                warn!("[soma/state] stop runtime reader: {error}");
+            }
+        }
+    }
+}
+
 impl RuntimeMonitor {
     pub async fn shutdown(mut self, atlas: &mut AtlasClient) {
-        let _ = self.child.kill().await;
+        stop_reader(&mut self.child).await;
+        for task in self.tasks {
+            task.abort();
+            let _ = task.await;
+        }
         for channel_id in self.channel_ids {
             let _ = atlas.disconnect_capability(&channel_id).await;
         }

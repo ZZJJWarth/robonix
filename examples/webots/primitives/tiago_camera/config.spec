@@ -53,9 +53,17 @@ config:
   # are unavailable.
   horizontal_fov_rad: 0.0
 
-  # float seconds, default: 60.0; must be greater than zero.
-  # Maximum startup wait for the first RGB image before init fails.
-  sentinel_timeout_s: 60.0
+  # float seconds, default: 90.0; must be finite and greater than zero.
+  # Launcher budget for Deferred INIT: reference seconds with ros_time,
+  # real steady seconds otherwise. ROBONIX_DRIVER_INIT_TIMEOUT_S overrides
+  # the launcher default when absent. Setup retains a real deadline.
+  sentinel_timeout_s: 90.0
+
+  # Inherited from the deployment's Chronos selection under managed startup.
+  # The extrinsics wait uses this reference; ros_time provider_id defaults
+  # to chronos. linux_system uses real steady elapsed time.
+  reference:
+    kind: linux_system
 
   # float seconds, default: 1.0; must be non-negative.
   # Time allowed for CameraInfo before configured intrinsics are used.

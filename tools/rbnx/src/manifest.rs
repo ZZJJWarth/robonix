@@ -146,6 +146,39 @@ pub fn prepare_deployment_manifest(
     }
     expand_deployment_yaml(&mut root);
     drop_disabled(&mut root)?;
+    let chronos = &root["system"]["chronos"];
+    if chronos["core"]["reference"]["kind"].as_str() == Some("ros_time") {
+        let reference = serde_yaml::to_value(serde_json::json!({
+            "kind": "ros_time",
+            "provider_id": chronos["provider_id"].as_str().unwrap_or("chronos"),
+        }))?;
+        for section in ["primitive", "service", "skill"] {
+            let Some(entries) = root.get_mut(section) else {
+                continue;
+            };
+            let entries = entries
+                .as_sequence_mut()
+                .with_context(|| format!("{section} must be a sequence"))?;
+            for entry in entries {
+                anyhow::ensure!(entry.is_mapping(), "{section} entry must be a mapping");
+                if entry["config"].is_null() {
+                    entry["config"] = serde_yaml::Value::Mapping(Default::default());
+                }
+                let config = entry["config"]
+                    .as_mapping_mut()
+                    .with_context(|| format!("{section} config must be a mapping"))?;
+                let key = serde_yaml::Value::String("reference".into());
+                if let Some(explicit) = config.get(&key) {
+                    anyhow::ensure!(
+                        explicit == &reference,
+                        "{section} reference must match system.chronos reference"
+                    );
+                } else {
+                    config.insert(key, reference.clone());
+                }
+            }
+        }
+    }
     Ok(root)
 }
 
@@ -641,6 +674,26 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packages_inherit_the_selected_chronos_reference() {
+        for section in ["primitive", "service", "skill"] {
+            let root: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "system:\n  chronos:\n    provider_id: clock-test\n    core:\n      reference:\n        kind: ros_time\n{section}:\n  - name: camera\n    path: camera\n",
+            )).unwrap();
+            let prepared = super::prepare_deployment_manifest(root, None).unwrap();
+            assert_eq!(
+                prepared[section][0]["config"]["reference"]["kind"],
+                "ros_time"
+            );
+            assert_eq!(
+                prepared[section][0]["config"]["reference"]["provider_id"],
+                "clock-test"
+            );
+            let mut mismatch = prepared;
+            mismatch[section][0]["config"]["reference"]["kind"] = "linux_system".into();
+            assert!(super::prepare_deployment_manifest(mismatch, None).is_err());
+        }
+    }
     #[test]
     fn disabled_entries_leave_the_deployment_and_say_so() {
         let mut root: serde_yaml::Value = serde_yaml::from_str(

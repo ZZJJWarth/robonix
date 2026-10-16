@@ -69,7 +69,8 @@ It never extrapolates simulation time from real elapsed time. Backward time
 requires a different generation; consumers must discard old-generation data.
 
 Chronos owns `/clock` input and publishes `robonix/system/chronos/reference_time`.
-Consumers must explicitly install a subscription before selecting ROS reference time.
+Soma subscribes when its deployment selects `ros_time`. Other consumers must
+explicitly install a subscription before selecting ROS reference time.
 `wall_time()` and `steady_time()` work independently of this subscription.
 
 ## Python

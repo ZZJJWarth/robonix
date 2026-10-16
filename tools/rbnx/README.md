@@ -123,6 +123,23 @@ ACTIVE with reference quality before devices register. Copy the `chronos` mappin
 to enable the camera test; the driver must already publish the described device
 timestamp scale.
 
+For simulation, select `system.chronos.core.reference.kind: ros_time`.
+Primitive, service and skill configs inherit that reference kind and Chronos
+provider id. Explicit references must match the deployment.
+When INIT or ACTIVATE returns `Deferred`, the launcher retries without rebuilding the
+provider's resources. Its wait budget uses `sentinel_timeout_s` (90 seconds
+when absent, or `ROBONIX_DRIVER_INIT_TIMEOUT_S` if set): reference seconds for
+`ros_time`, real steady seconds otherwise.
+Pause stops the reference budget; a new generation restarts it. Missing initial
+reference input waits for the first reading. Reference stream loss fails the
+wait instead of falling back. Connections and individual lifecycle RPCs keep
+real deadlines; `ROBONIX_DRIVER_INIT_TIMEOUT_S` overrides the initial RPC
+deadline (default 90 seconds). Retry RPCs must respond within five real
+seconds. Cancellation releases the Driver and reference channels.
+The enclosing 180-second primitive and skill bring-up budgets also use
+reference time in ROS time deployments. Soma process exit and readiness queries
+retain real failure checks, so pausing does not hide a dead process or a broken connection.
+
 For example, this enables Vitals without a separate terminal or global
 `RUST_LOG` setting:
 

@@ -112,6 +112,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     "grpcio==1.80.0" "protobuf==6.33.6" "mcp==1.29.0" "fastmcp==3.4.7" \
     numpy Pillow "uvicorn==0.52.3" "httpx==0.28.1" "websockets==16.1.1"
 
+COPY _chronos_wheels/*.whl /tmp/chronos-wheels/
+RUN python3 -m pip install --no-deps /tmp/chronos-wheels/*.whl \
+    && rm -rf /tmp/chronos-wheels
+
 ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
 # Build context is sim/bridge/ — ros_ws lives one level up at sim/ros_ws/.

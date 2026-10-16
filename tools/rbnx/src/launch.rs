@@ -19,8 +19,8 @@
 //     a `before` snapshot so callers can reason about "which provider
 //     appeared because of this spawn." Returns the provider plus every
 //     lifecycle Driver observed during declaration settling.
-//   * `call_driver_cmd` — one Driver(cmd) RPC against a freshly-connected
-//     channel, no UI. Returns the response's `state` string.
+//   * `call_driver_cmd` — Driver(cmd) calls with deferred INIT/ACTIVATE retries,
+//     channel cleanup and the response's `state` string.
 //   * `CMD_*` constants and the `DRIVER_*_TIMEOUT` values — single source
 //     of truth so rbnx + soma agree on the deadlines.
 //   * `contract_id_to_service_name` — mirrors codegen's PascalCase rule,
@@ -41,6 +41,7 @@
 // Soma; both are workspace members and bumped together. The API is
 // free to evolve as long as we keep the two callers in sync.
 
+use crate::pb::contracts::robonix_system_chronos_reference_time_client::RobonixSystemChronosReferenceTimeClient;
 use crate::pb::lifecycle::{DriverRequest, DriverResponse};
 use anyhow::{Context, Result};
 use robonix_atlas::client::AtlasClient;
@@ -67,19 +68,203 @@ pub const CMD_SHUTDOWN: u32 = 3;
 /// driver capability with atlas before giving up.
 pub const DRIVER_REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Max time we'll wait for one `Driver(CMD_*)` RPC to return. 90s gives
-/// generous slack for slow-warming sensors (Webots's camera can take
-/// 30–50s on cold boot). Primitive driver-side waits should stay
-/// strictly below this so they own their own timeout semantics rather
-/// than racing the CLI deadline.
+/// Real deadline for one lifecycle RPC; deferred observation waits use a separate budget.
 pub const DRIVER_INIT_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Consumer id used by both rbnx-cli (deploy) and Soma when opening
-/// channels to call `Driver(...)` during boot. Atlas just records the
-/// edge for bookkeeping — the id is only ever read in `inspect_atlas`
-/// output, so we keep one stable string instead of inventing per-caller
-/// ones (would only add noise).
+fn driver_init_timeout() -> Duration {
+    std::env::var("ROBONIX_DRIVER_INIT_TIMEOUT_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DRIVER_INIT_TIMEOUT)
+}
+
+/// Consumer prefix; each provider gets its own lifecycle channel cleanup scope.
 pub const BOOT_CONSUMER_ID: &str = "rbnx-cli/deploy";
+
+const REFERENCE_CONTRACT: &str = "robonix/system/chronos/reference_time";
+
+struct DriverChannels {
+    atlas: Option<AtlasClient>,
+    consumer: String,
+    bindings: Vec<(String, String)>,
+}
+
+impl DriverChannels {
+    async fn close(&mut self) -> Result<()> {
+        if let Some(atlas) = self.atlas.as_mut() {
+            release_driver_channels(atlas, &self.consumer, &self.bindings).await?;
+        }
+        self.atlas = None;
+        Ok(())
+    }
+}
+
+impl Drop for DriverChannels {
+    fn drop(&mut self) {
+        if let Some(mut atlas) = self.atlas.take() {
+            let consumer = self.consumer.clone();
+            let bindings = std::mem::take(&mut self.bindings);
+            tokio::spawn(async move {
+                if let Err(error) = release_driver_channels(&mut atlas, &consumer, &bindings).await
+                {
+                    warn!("[{consumer}] lifecycle channel cleanup failed: {error:#}");
+                }
+            });
+        }
+    }
+}
+
+async fn release_driver_channels(
+    atlas: &mut AtlasClient,
+    consumer: &str,
+    bindings: &[(String, String)],
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let response = atlas
+            .inner()
+            .inspect_atlas(atlas_pb::InspectAtlasRequest {})
+            .await?;
+        let inspected: serde_json::Value = serde_json::from_str(&response.into_inner().json)?;
+        let channels = inspected["channels"]
+            .as_object()
+            .context("Atlas inspection has no channels")?;
+        for (id, channel) in channels {
+            if channel["consumer_id"].as_str() == Some(consumer)
+                && channel["transport"].as_str() == Some(atlas_pb::Transport::Grpc.as_str_name())
+                && bindings.iter().any(|(provider, contract)| {
+                    channel["provider_id"].as_str() == Some(provider)
+                        && channel["contract_id"].as_str() == Some(contract)
+                })
+            {
+                atlas.disconnect_capability(id).await?;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("lifecycle channel cleanup timed out")?
+}
+
+#[derive(Default)]
+struct DriverReferenceDeadline {
+    previous: Option<(i64, u64)>,
+    elapsed: Duration,
+}
+
+impl DriverReferenceDeadline {
+    fn observe(&mut self, timestamp_ns: i64, generation: u64, available: bool) -> Result<()> {
+        if !available {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            timestamp_ns >= 0 && generation > 0,
+            "invalid Chronos reference reading"
+        );
+        if let Some((previous, previous_generation)) = self.previous {
+            if generation != previous_generation {
+                self.elapsed = Duration::ZERO;
+            } else {
+                anyhow::ensure!(
+                    timestamp_ns >= previous,
+                    "Chronos reference regressed without a generation change"
+                );
+                self.elapsed += Duration::from_nanos((timestamp_ns - previous) as u64);
+            }
+        }
+        self.previous = Some((timestamp_ns, generation));
+        Ok(())
+    }
+}
+
+pub struct ReferenceWait {
+    channels: DriverChannels,
+    stream: tonic::Streaming<crate::pb::chronos::ReferenceQuality>,
+    deadline: DriverReferenceDeadline,
+    last_reading: Instant,
+}
+
+impl ReferenceWait {
+    pub async fn connect(atlas: &mut AtlasClient, consumer: &str, provider: &str) -> Result<Self> {
+        anyhow::ensure!(
+            !provider.is_empty() && provider == provider.trim(),
+            "reference provider_id must be nonempty and whitespace-normalized"
+        );
+        let channels = DriverChannels {
+            atlas: Some(atlas.clone()),
+            consumer: consumer.into(),
+            bindings: vec![(provider.into(), REFERENCE_CONTRACT.into())],
+        };
+        let (_, endpoint, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            atlas.connect_capability(
+                consumer,
+                provider,
+                REFERENCE_CONTRACT,
+                atlas_pb::Transport::Grpc,
+            ),
+        )
+        .await
+        .context("Chronos Atlas connection timed out")??;
+        let address = if endpoint.starts_with("http") {
+            endpoint
+        } else {
+            format!("http://{endpoint}")
+        };
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(2),
+            RobonixSystemChronosReferenceTimeClient::connect(address),
+        )
+        .await
+        .context("Chronos reference connection timed out")??;
+        let stream = tokio::time::timeout(Duration::from_secs(2), client.reference_time(()))
+            .await
+            .context("Chronos reference subscription timed out")??
+            .into_inner();
+        Ok(Self {
+            channels,
+            stream,
+            deadline: DriverReferenceDeadline::default(),
+            last_reading: Instant::now(),
+        })
+    }
+
+    pub async fn tick(&mut self) -> Result<Duration> {
+        // Startup polling can be slower than publication; consume buffered readings too.
+        for index in 0..64 {
+            let limit = if index == 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::ZERO
+            };
+            match tokio::time::timeout(limit, self.stream.message()).await {
+                Ok(result) => {
+                    let reading =
+                        result?.context("Chronos reference stream ended during initialization")?;
+                    self.last_reading = Instant::now();
+                    self.deadline.observe(
+                        reading.timestamp_ns,
+                        reading.generation,
+                        reading.available,
+                    )?;
+                }
+                Err(_) => {
+                    anyhow::ensure!(
+                        self.last_reading.elapsed() < Duration::from_secs(5),
+                        "Chronos reference stream stopped responding during initialization"
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(self.deadline.elapsed)
+    }
+
+    pub async fn close(&mut self) -> Result<()> {
+        self.channels.close().await
+    }
+}
 
 /// Runtime-owned process and lifecycle metadata for one package wrapper.
 ///
@@ -849,14 +1034,8 @@ pub async fn wait_for_registration_core(
     }
 }
 
-/// Issue one `Driver(cmd)` RPC against a freshly-connected channel, then
-/// release the channel. Returns the response's `state` string on success;
-/// bails when ok=false or the RPC itself fails. Mirrors rbnx-cli's boot
-/// behaviour for both CMD_INIT and CMD_ACTIVATE so Soma drives the same
-/// lifecycle transitions.
-///
-/// `who` shows up in every error message so callers can attribute
-/// failures to a specific package without re-wrapping each return.
+/// Run a lifecycle command, retrying deferred INIT/ACTIVATE within the selected time budget.
+/// Returns the response state and releases the owned channels; `who` identifies errors.
 pub async fn call_driver_cmd(
     atlas: &mut AtlasClient,
     provider_id: &str,
@@ -872,68 +1051,105 @@ pub async fn call_driver_cmd(
         CMD_SHUTDOWN => "SHUTDOWN",
         _ => "?",
     };
-    let (channel_id, endpoint, _params) = atlas
-        .connect_capability(
-            BOOT_CONSUMER_ID,
-            provider_id,
-            driver_contract,
-            atlas_pb::Transport::Grpc,
-        )
-        .await
-        .with_context(|| format!("[{who}] ConnectCapability for {driver_contract}"))?;
-    let normalized = if endpoint.starts_with("http") {
-        endpoint
-    } else {
-        format!("http://{endpoint}")
+    let consumer = format!("{BOOT_CONSUMER_ID}/{provider_id}");
+    let mut channels = DriverChannels {
+        atlas: Some(atlas.clone()),
+        consumer: consumer.clone(),
+        bindings: vec![(provider_id.into(), driver_contract.into())],
     };
+    let mut reference: Option<ReferenceWait> = None;
     let result = async {
-        let channel = Endpoint::new(normalized.clone())
-            .with_context(|| format!("invalid driver endpoint '{normalized}'"))?
-            .connect()
-            .await
-            .with_context(|| format!("dial driver at '{normalized}'"))?;
+        let (_, endpoint, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            atlas.connect_capability(&consumer, provider_id, driver_contract, atlas_pb::Transport::Grpc),
+        ).await.context("Driver Atlas connection timed out")??;
+        let normalized = if endpoint.starts_with("http") { endpoint } else { format!("http://{endpoint}") };
+        let channel = Endpoint::new(normalized.clone())?
+            .connect_timeout(Duration::from_secs(2))
+            .connect().await.with_context(|| format!("dial driver at '{normalized}'"))?;
         let svc_name = contract_id_to_service_name(driver_contract);
         let path: tonic::codegen::http::uri::PathAndQuery =
-            format!("/robonix.contracts.{svc_name}/Driver")
-                .parse()
-                .with_context(|| format!("build gRPC path for '{driver_contract}'"))?;
+            format!("/robonix.contracts.{svc_name}/Driver").parse()?;
         let mut grpc = tonic::client::Grpc::new(channel);
-        grpc.ready().await.with_context(|| "gRPC ready")?;
-        let codec: tonic_prost::ProstCodec<DriverRequest, DriverResponse> = Default::default();
-        let resp = tokio::time::timeout(
-            DRIVER_INIT_TIMEOUT,
-            grpc.unary(
-                Request::new(DriverRequest {
-                    command: cmd,
-                    config_json,
-                }),
-                path,
-                codec,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Driver(CMD_{cmd_name}) timed out after {:?}",
-                DRIVER_INIT_TIMEOUT
-            )
-        })?
-        .with_context(|| format!("Driver(CMD_{cmd_name}) RPC failed"))?;
-        Ok::<_, anyhow::Error>(resp.into_inner())
-    }
-    .await;
-    // Always disconnect, even on error — Atlas counts open channels and
-    // we don't want them to leak when boot races a half-up provider.
-    let _ = atlas.disconnect_capability(&channel_id).await;
-    let r = result.map_err(|e| anyhow::anyhow!("[{who}] Driver(CMD_{cmd_name}): {e:#}"))?;
-    if !r.ok {
-        anyhow::bail!(
-            "[{who}] Driver(CMD_{cmd_name}) returned ok=false (state={}, error={})",
-            r.state,
-            r.error
-        );
-    }
-    Ok(r.state)
+        let mut waiting_since: Option<Instant> = None;
+        let initial_timeout = driver_init_timeout();
+        let mut budget = initial_timeout;
+        let mut reason = String::new();
+        loop {
+            let retry = waiting_since.is_some();
+            let rpc = async {
+                if retry {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                tokio::time::timeout(Duration::from_secs(2), grpc.ready()).await??;
+                let limit = if retry { Duration::from_secs(5) } else { initial_timeout };
+                let mut request = Request::new(DriverRequest { command: cmd, config_json: config_json.clone() });
+                request.set_timeout(limit);
+                let codec: tonic_prost::ProstCodec<DriverRequest, DriverResponse> = Default::default();
+                let response = tokio::time::timeout(limit, grpc.unary(request, path.clone(), codec))
+                    .await.with_context(|| format!("Driver(CMD_{cmd_name}) RPC timed out after {limit:?}"))??;
+                Ok::<_, anyhow::Error>(response.into_inner())
+            };
+            tokio::pin!(rpc);
+            let response = loop {
+                tokio::select! {
+                    reply = &mut rpc => break reply?,
+                    reading = async {
+                        match reference.as_mut() {
+                            Some(wait) => wait.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        anyhow::ensure!(reading? < budget,
+                            "Driver(CMD_{cmd_name}) deferred wait exceeded {budget:?} of reference time");
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)), if retry && reference.is_none() => {
+                            anyhow::ensure!(waiting_since.unwrap().elapsed() < budget,
+                                "Driver(CMD_{cmd_name}) deferred wait exceeded {budget:?} of real time");
+                    }
+                }
+            };
+            if response.ok {
+                return Ok(response.state);
+            }
+            anyhow::ensure!(matches!(cmd, CMD_INIT | CMD_ACTIVATE) && response.state == "deferred",
+                "Driver(CMD_{cmd_name}) returned ok=false (state={}, error={})", response.state, response.error);
+            if waiting_since.is_none() {
+                let config: serde_json::Value = serde_json::from_str(&config_json)?;
+                if let Some(value) = config.get("sentinel_timeout_s") {
+                    let seconds = value.as_f64().or_else(|| value.as_str()?.parse().ok())
+                        .context("sentinel_timeout_s must be a positive number")?;
+                    anyhow::ensure!(seconds.is_finite() && seconds > 0.0, "sentinel_timeout_s must be finite and positive");
+                    budget = Duration::try_from_secs_f64(seconds)?;
+                }
+                waiting_since = Some(Instant::now());
+                let kind = if config["reference"]["kind"].is_null() { "linux_system" } else {
+                    config["reference"]["kind"].as_str().context("reference kind must be a string")?
+                };
+                anyhow::ensure!(matches!(kind, "linux_system" | "ros_time"), "reference kind must be linux_system or ros_time");
+                if kind == "ros_time" {
+                    let provider = if config["reference"]["provider_id"].is_null() { "chronos" } else {
+                        config["reference"]["provider_id"].as_str().context("reference provider_id must be a string")?
+                    };
+                    reference = Some(ReferenceWait::connect(atlas, &consumer, provider).await?);
+                }
+            }
+            if reason != response.error {
+                info!("[{who}] {provider_id} Driver(CMD_{cmd_name}) deferred: {}", response.error);
+                reason = response.error;
+            }
+        }
+    }.await;
+    let reference_cleanup = match reference.as_mut() {
+        Some(wait) => wait.close().await,
+        None => Ok(()),
+    };
+    let cleanup = channels.close().await;
+    let state =
+        result.map_err(|error| anyhow::anyhow!("[{who}] Driver(CMD_{cmd_name}): {error:#}"))?;
+    cleanup.context("release lifecycle channels")?;
+    reference_cleanup.context("release reference channels")?;
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -949,6 +1165,100 @@ mod tests {
 
     const SHARED: &str = "robonix/lifecycle/driver";
     const LEGACY: &str = "robonix/primitive/camera/driver";
+
+    #[test]
+    fn deferred_reference_budget_holds_during_pause_and_restarts_on_reset() {
+        let mut deadline = super::DriverReferenceDeadline::default();
+        deadline.observe(0, 1, true).unwrap();
+        for _ in 0..100 {
+            deadline.observe(0, 1, true).unwrap();
+        }
+        assert_eq!(deadline.elapsed, std::time::Duration::ZERO);
+        deadline.observe(2_000_000_000, 1, true).unwrap();
+        assert_eq!(deadline.elapsed, std::time::Duration::from_secs(2));
+        deadline.observe(9_000_000_000, 1, false).unwrap();
+        assert_eq!(deadline.elapsed, std::time::Duration::from_secs(2));
+        deadline.observe(0, 2, true).unwrap();
+        assert_eq!(deadline.elapsed, std::time::Duration::ZERO);
+        deadline.observe(1_000_000_000, 2, true).unwrap();
+        assert_eq!(deadline.elapsed, std::time::Duration::from_secs(1));
+        assert!(deadline.observe(0, 2, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn canceled_driver_wait_releases_only_its_own_channels() {
+        use robonix_atlas::{
+            client,
+            service::{AtlasRegistry, serve_atlas},
+        };
+        use std::sync::Arc;
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let registry = Arc::new(AtlasRegistry::default());
+        let server = tokio::spawn(serve_atlas(registry.clone(), address));
+        let mut atlas = robonix_atlas::client::AtlasClient::connect_with_retry(
+            address.to_string(),
+            50,
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        atlas
+            .register_primitive("camera", "robonix/primitive/camera", "")
+            .await
+            .unwrap();
+        atlas
+            .declare_capability(
+                "camera",
+                SHARED,
+                atlas_pb::Transport::Grpc,
+                "127.0.0.1:1",
+                client::grpc_params(
+                    "capabilities/lifecycle/driver.v1.toml",
+                    "robonix.contracts.RobonixLifecycleDriver",
+                    "/robonix.contracts.RobonixLifecycleDriver/Driver",
+                ),
+            )
+            .await
+            .unwrap();
+        let (other, _, _) = atlas
+            .connect_capability("other", "camera", SHARED, atlas_pb::Transport::Grpc)
+            .await
+            .unwrap();
+        let (owned, _, _) = atlas
+            .connect_capability(
+                "rbnx-cli/deploy/camera",
+                "camera",
+                SHARED,
+                atlas_pb::Transport::Grpc,
+            )
+            .await
+            .unwrap();
+        let guard = super::DriverChannels {
+            atlas: Some(atlas.clone()),
+            consumer: "rbnx-cli/deploy/camera".into(),
+            bindings: vec![("camera".into(), SHARED.into())],
+        };
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let inspected: serde_json::Value =
+                serde_json::from_str(&registry.inspect_json().await.unwrap()).unwrap();
+            assert!(inspected["channels"].get(&other).is_some());
+            if inspected["channels"].get(&owned).is_none() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        server.abort();
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

@@ -121,6 +121,7 @@ services:
       # Soma runs on the host but its ROS 2 runtime reader runs in this
       # container, where rclpy and the simulator topic graph live.
       - ../rbnx-boot/logs/soma-runtime:/robonix_runtime/soma:rw
+      - ../../../system/chronos:/robonix_runtime/chronos:ro
       - ../../../pylib:/robonix_pkgs/pylib:ro
 
 volumes:
