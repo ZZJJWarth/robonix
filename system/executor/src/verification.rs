@@ -89,6 +89,7 @@ pub async fn verify_result(
         runtime,
         &node.plan_id,
         Some(VERIFICATION_TIMEOUT),
+        !policy.overlap(),
     )
     .await;
     if !response.success {

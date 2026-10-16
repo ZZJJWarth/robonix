@@ -68,3 +68,5 @@ env.sh
 develop_specs/
 
 *.egg-info/
+
+examples/webots/.robonix_manifest.chronos.yaml

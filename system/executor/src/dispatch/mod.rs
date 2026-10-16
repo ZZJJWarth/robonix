@@ -80,12 +80,11 @@ pub async fn dispatch(
     runtime: &PlanRuntime,
     plan_id: &str,
 ) -> CapabilityCallResult {
-    dispatch_with_timeout(call, self_provider_id, atlas, runtime, plan_id, None).await
+    dispatch_with_timeout(call, self_provider_id, atlas, runtime, plan_id, None, false).await
 }
 
-/// Dispatch one call with an optional MCP deadline while always releasing its
-/// Atlas channel. Verification uses this to bound a verifier that stops
-/// responding without leaking the ConnectCapability record.
+/// Bound verification's real inactivity while retaining camera evidence waits
+/// and releasing the Atlas channel when a caller stops waiting.
 pub async fn dispatch_with_timeout(
     call: &CapabilityCall,
     self_provider_id: &str,
@@ -93,6 +92,7 @@ pub async fn dispatch_with_timeout(
     runtime: &PlanRuntime,
     plan_id: &str,
     timeout: Option<Duration>,
+    cancel_on_plan: bool,
 ) -> CapabilityCallResult {
     if call.provider_id == self_provider_id {
         return builtin::execute(call, runtime, self_provider_id, atlas, plan_id).await;
@@ -117,20 +117,30 @@ pub async fn dispatch_with_timeout(
         }
     };
 
-    let result = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, mcp::execute(call, &endpoint)).await
-        {
-            Ok(result) => result,
-            Err(_) => error_result(
-                call,
-                format!("MCP call timed out after {}s", duration.as_secs()),
-            ),
-        },
-        None => mcp::execute(call, &endpoint).await,
+    let (cancel_on_drop, cancel) = tokio::sync::oneshot::channel();
+    let owned_call = call.clone();
+    let mut cleanup_atlas = atlas.clone();
+    let mut worker = tokio::spawn(async move {
+        let result = mcp::execute_with_timeout(&owned_call, &endpoint, timeout, cancel).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            cleanup_atlas.disconnect_capability(&channel_id),
+        )
+        .await;
+        result
+    });
+    let result = tokio::select! {
+        result = &mut worker => result,
+        _ = async {
+            while !runtime.is_cancelled(plan_id).await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }, if cancel_on_plan => {
+            drop(cancel_on_drop);
+            worker.await
+        }
     };
-
-    let _ = atlas.disconnect_capability(&channel_id).await;
-    result
+    result.unwrap_or_else(|e| error_result(call, format!("MCP worker failed: {e}")))
 }
 
 /// If `provider_id` is a skill that hasn't been activated in this process

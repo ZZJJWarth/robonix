@@ -5,10 +5,13 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import queue
 import re
 import threading
 import time
 from typing import Any, Callable
+
+from robonix_api._reference_time import _ReferenceClock
 
 RGB_CONTRACT = "robonix/primitive/camera/rgb"
 
@@ -75,12 +78,13 @@ class _CameraEntry:
     channel: Any
     subscription: Any
     message: Any = None
+    receipt: Any = None
 
 
 class CameraPool:
     """Own one ROS node and one long-lived subscription per camera provider."""
 
-    def __init__(self, atlas: Callable[[], Any], consumer_id: str):
+    def __init__(self, atlas: Callable[[], Any], consumer_id: str, reference=None):
         self._atlas = atlas
         self._consumer_id = consumer_id
         self._condition = threading.Condition()
@@ -89,8 +93,11 @@ class CameraPool:
         self._node = None
         self._executor = None
         self._spin_thread = None
+        self._spin_failure = None
+        self._spin_at = time.monotonic()
         self._stop = threading.Event()
         self._closed = False
+        self._reference = _ReferenceClock(reference, consumer_id + "/reference")
 
     def _ensure_ros(self):
         """Start the shared ROS context, node, executor, and spin thread once."""
@@ -108,6 +115,7 @@ class CameraPool:
         self._spin_thread = threading.Thread(
             target=self._spin, name="vlm-verifier-camera", daemon=True,
         )
+        self._spin_at = time.monotonic()
         self._spin_thread.start()
 
     def _spin(self):
@@ -115,7 +123,11 @@ class CameraPool:
         while not self._stop.is_set():
             try:
                 self._executor.spin_once(timeout_sec=0.1)
-            except Exception:
+                self._spin_at = time.monotonic()
+            except Exception as exc:
+                with self._condition:
+                    self._spin_failure = exc
+                    self._condition.notify_all()
                 if not self._stop.is_set():
                     log.exception("shared camera ROS spin loop stopped")
                 return
@@ -138,7 +150,11 @@ class CameraPool:
             def receive(message):
                 """Replace this provider's cached frame and wake initial readers."""
                 with self._condition:
+                    reading = self._reference.read()
+                    if reading is None:
+                        return
                     entry.message = message
+                    entry.receipt = reading
                     self._condition.notify_all()
 
             try:
@@ -153,32 +169,60 @@ class CameraPool:
             self._entries[provider_id] = entry
             return entry
 
-    def capture_sync(self, provider_id, stop):
-        """Return the cached latest frame, waiting only for the first delivery."""
-        deadline = time.monotonic() + 5
+    def capture_sync(self, provider_id, stop, checkpoints):
+        """Wait for a current-generation frame within five reference seconds."""
+        start = self._reference.read()
+        if start is None:
+            raise OSError("Chronos reference unavailable")
         entry = self._ensure_camera(provider_id)
+        missing_since = time.monotonic()
         with self._condition:
-            while entry.message is None and not stop.is_set() and not self._closed:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._condition.wait(timeout=min(0.1, remaining))
-            if entry.message is None:
-                raise TimeoutError("camera observation timed out")
-            message = entry.message
-        return encode_jpeg(message)
+            while not stop.is_set() and not self._closed:
+                if self._spin_failure is not None:
+                    raise RuntimeError("camera ROS executor stopped") from self._spin_failure
+                if time.monotonic() - self._spin_at >= 5:
+                    raise TimeoutError("camera ROS executor is unresponsive")
+                current = self._reference.read()
+                if current is None or current[1:] != start[1:] or current[0] < start[0]:
+                    raise OSError("Chronos reference interrupted during camera observation")
+                receipt = entry.receipt
+                if (entry.message is not None and receipt is not None
+                        and receipt[1:] == current[1:] and 0 <= current[0] - receipt[0] <= 5_000_000_000):
+                    return entry.message
+                if current[0] - start[0] >= 5_000_000_000:
+                    raise TimeoutError("camera observation timed out")
+                if self._node.count_publishers(entry.channel.endpoint):
+                    missing_since = time.monotonic()
+                elif time.monotonic() - missing_since >= 5:
+                    raise OSError("camera ROS publisher unavailable")
+                try:
+                    checkpoints.put_nowait(current)
+                except queue.Full:
+                    pass
+                self._condition.wait(timeout=0.1)
+        raise RuntimeError("camera observation stopped")
 
-    async def capture(self, provider_id):
+    async def capture(self, provider_id, on_wait=None):
         """Read the shared latest-frame cache without blocking the MCP event loop."""
         stop = threading.Event()
+        checkpoints = queue.Queue(maxsize=1)
+        worker = asyncio.create_task(asyncio.to_thread(self.capture_sync, provider_id, stop, checkpoints))
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self.capture_sync, provider_id, stop), 5,
-            )
+            while not worker.done():
+                await asyncio.wait({worker}, timeout=1)
+                if not worker.done() and on_wait is not None:
+                    try:
+                        reading = checkpoints.get_nowait()
+                    except queue.Empty:
+                        continue
+                    await asyncio.wait_for(on_wait(reading), 2)
+            message = worker.result()
+            return await asyncio.wait_for(asyncio.to_thread(encode_jpeg, message), 5)
         finally:
             stop.set()
             with self._condition:
                 self._condition.notify_all()
+            await asyncio.gather(worker, return_exceptions=True)
 
     def close(self):
         """Stop ROS work and release all retained channels at service shutdown."""
@@ -200,3 +244,4 @@ class CameraPool:
             self._context.shutdown()
         for entry in entries:
             entry.channel.close()
+        self._reference.close()

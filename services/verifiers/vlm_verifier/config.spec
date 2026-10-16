@@ -5,6 +5,16 @@ description: >-
   not here.
 
 properties:
+  reference:
+    type: object
+    description: Selected clock inherited from the deployment for camera waits and image age.
+    properties:
+      kind:
+        type: string
+        enum: [linux_system, ros_time]
+      provider_id:
+        type: string
+        description: Chronos provider ID for ros_time; defaults to chronos.
   vlm:
     type: object
     description: Model endpoint, credential and model ID. All three fields are required and must be non-empty strings.

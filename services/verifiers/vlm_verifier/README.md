@@ -157,14 +157,21 @@ values or original strings.
   and `sensor_msgs`. Pillow and the other Python dependencies are installed at build time.
 - `ROS_DISTRO` selects an installed ROS distribution. `RMW_IMPLEMENTATION`
   and `ROS_DOMAIN_ID` must match the camera.
-- The first request for a camera waits for its first delivered frame; later
-  requests immediately use the latest frame held by the shared subscription.
+- Camera waits and cached-image age use the selected reference, with a limit
+  of five reference seconds. A current-generation cached image stays valid
+  during pause. A reference reset or interruption rejects pending work and
+  cached images; no wall-time fallback is used. `rbnx boot` inherits the deployment's
+  `reference` configuration, including the Chronos provider for `ros_time`.
 - Supported image encodings: `rgb8`, `bgr8`, `rgba8`, `bgra8`, and `mono8`.
   Dimensions, row stride, and payload length are validated. Depth and camera
   intrinsics are not required. Conversion does not depend on cv_bridge.
-- Fixed deadlines: 50 seconds overall, 5 seconds for observation, and 40 seconds
-  for VLM evaluation, below Executor's 60-second verification timeout.
-  These are implementation constants, not configurable YAML fields.
+- Atlas calls, JPEG conversion, frame-file writing and model work keep real
+  limits. VLM evaluation is bounded to 40 real seconds. Executor keeps a
+  60-second real watchdog, extended only by structured MCP log checkpoints
+  emitted from the guarded camera wait. Those checkpoints report the reference
+  reading; they do not count real polling as robot progress. A blocked operation
+  outside that wait stops the checkpoints and times out. These limits are
+  implementation constants. Cancellation uses the standard MCP notification.
 - One image and one model request per verification. No retries or multiple-view voting.
 
 ## Build and start

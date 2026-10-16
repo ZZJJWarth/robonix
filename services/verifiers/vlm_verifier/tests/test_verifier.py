@@ -209,19 +209,129 @@ class RequestTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertTrue(stopped.is_set())
 
-    async def test_timeout_budgets(self):
-        """Check timeout budgets."""
+    async def test_observation_wait_does_not_spend_the_model_deadline(self):
         original = asyncio.wait_for
-        budgets = []
 
         async def track(awaitable, timeout):
-            budgets.append(timeout)
-            return await original(awaitable, timeout)
+            return await original(awaitable, .01)
+
+        async def observe(_):
+            await asyncio.sleep(.03)
+            return b"frame"
 
         with patch("vlm_verifier.core.asyncio.wait_for", side_effect=track):
-            await core.verify("call", json.dumps(envelope()), AsyncMock(return_value=b"x"),
-                              AsyncMock(return_value={"passed": True, "detail": "x"}))
-        self.assertEqual(budgets, [50, 5, 40])
+            verdict = await core.verify("call", json.dumps(envelope()), observe,
+                                         AsyncMock(return_value={"passed": True, "detail": "x"}))
+        self.assertTrue(verdict["passed"])
+
+    async def test_model_timeout_and_reset_reject_pending_results(self):
+        async def stalled_model(*_):
+            await asyncio.sleep(10)
+
+        with patch("vlm_verifier.core._MODEL_TIMEOUT", .01):
+            with self.assertRaisesRegex(RuntimeError, "TimeoutError"):
+                await core.verify("call", json.dumps(envelope()), AsyncMock(return_value=b"frame"),
+                                  stalled_model)
+        reading = [(0, 1, 1)]
+
+        async def reset_model(*_):
+            reading[0] = (0, 2, 1)
+            return {"passed": True, "detail": "old"}
+
+        with self.assertRaisesRegex(RuntimeError, "OSError"):
+            await core.verify("call", json.dumps(envelope()), AsyncMock(return_value=b"frame"),
+                              reset_model, reference=lambda: reading[0])
+
+        reading[0] = (0, 1, 1)
+        entered, canceled = asyncio.Event(), asyncio.Event()
+
+        async def pending_model(*_):
+            entered.set()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                canceled.set()
+
+        task = asyncio.create_task(core.verify(
+            "call", json.dumps(envelope()), AsyncMock(return_value=b"frame"),
+            pending_model, reference=lambda: reading[0]))
+        await entered.wait()
+        reading[0] = (0, 2, 1)
+        with self.assertRaisesRegex(RuntimeError, "OSError"):
+            await asyncio.wait_for(task, .5)
+        self.assertTrue(canceled.is_set())
+
+
+class CameraWaitTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.reading = (0, 1, 1)
+        self.pool = camera.CameraPool(Mock(), "test")
+        self.pool._reference = Mock(read=lambda: self.reading)
+        self.pool._node = Mock()
+        self.pool._node.count_publishers.return_value = 1
+        self.entry = camera._CameraEntry(Mock(), None)
+        self.pool._ensure_camera = lambda _: self.entry
+        self.encode = patch.object(camera, "encode_jpeg", return_value=b"jpeg")
+        self.encode.start()
+
+    def tearDown(self):
+        self.encode.stop()
+        self.pool.close()
+
+    def deliver(self):
+        with self.pool._condition:
+            self.entry.message = object()
+            self.entry.receipt = self.reading
+            self.pool._condition.notify_all()
+
+    async def test_frozen_zero_wait_and_current_cache(self):
+        task = asyncio.create_task(self.pool.capture("camera"))
+        await asyncio.sleep(.1)
+        self.assertFalse(task.done())
+        self.deliver()
+        self.assertEqual(await asyncio.wait_for(task, 1), b"jpeg")
+        await asyncio.sleep(.05)
+        self.assertEqual(await self.pool.capture("camera"), b"jpeg")
+
+    async def test_old_generation_cache_waits_for_new_delivery_and_reset_aborts(self):
+        self.deliver()
+        self.reading = (0, 2, 1)
+        task = asyncio.create_task(self.pool.capture("camera"))
+        await asyncio.sleep(.1)
+        self.assertFalse(task.done())
+        self.deliver()
+        self.assertEqual(await asyncio.wait_for(task, 1), b"jpeg")
+        self.reading = (0, 3, 1)
+        task = asyncio.create_task(self.pool.capture("camera"))
+        await asyncio.sleep(.05)
+        self.reading = (0, 4, 1)
+        with self.assertRaises(OSError):
+            await asyncio.wait_for(task, 1)
+
+    async def test_cancel_and_reference_timeout_stop_waiting(self):
+        task = asyncio.create_task(self.pool.capture("camera"))
+        await asyncio.sleep(.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        task = asyncio.create_task(self.pool.capture("camera"))
+        await asyncio.sleep(.05)
+        self.reading = (6_000_000_000, 1, 1)
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(task, 1)
+
+    async def test_failed_ros_reader_stops_waiting_during_pause(self):
+        task = asyncio.create_task(self.pool.capture("camera"))
+        await asyncio.sleep(.05)
+        with self.pool._condition:
+            self.pool._spin_failure = RuntimeError("reader failed")
+            self.pool._condition.notify_all()
+        with self.assertRaisesRegex(RuntimeError, "ROS executor stopped"):
+            await asyncio.wait_for(task, 1)
+        self.pool._spin_failure = None
+        self.pool._spin_at -= 6
+        with self.assertRaisesRegex(TimeoutError, "ROS executor is unresponsive"):
+            await asyncio.wait_for(self.pool.capture("camera"), 1)
 
 
 if __name__ == "__main__":

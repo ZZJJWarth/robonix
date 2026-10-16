@@ -69,12 +69,12 @@ async def check(entry, mcp_port, model):
                             id=provider, state=pb.STATE_INACTIVE))
                         await atlas.SetLifecycleState(pb.SetLifecycleStateRequest(
                             id=provider, state=pb.STATE_ACTIVE))
-                    config = {"verification": [{
+                    config = {"verification": {"overlap": False, "rules": [{
                         "target_contract_id": "robonix/system/executor/builtin/run_command",
                         "target_provider_id": "executor",
                         "verifier_provider_id": "vlm_verifier",
                         "verifier_args": {"camera_provider_id": "wrist"},
-                    }]}
+                    }]}}
                     processes.append(subprocess.Popen([
                         executor_bin, "--atlas", atlas_endpoint, "--listen", executor_endpoint,
                         "--id", "executor", "--config-json", json.dumps(config),

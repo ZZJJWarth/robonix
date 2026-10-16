@@ -126,8 +126,15 @@ request carries the original call id plus an opaque JSON payload containing the
 target provider, contract, RTDL node description, arguments, output, and the
 configured `verifier_args`.
 
-Verification is fail-closed and has a fixed 60-second timeout. `passed=true`
-preserves the original successful result. `passed=false` changes the original
+Verification is fail-closed and keeps a 60-second real watchdog. VLM Verifier
+can extend it only from checkpoints emitted by its guarded camera wait;
+each request accepts at most five reference seconds of camera waiting.
+Model evaluation retains its own 40-second real limit. A paused camera can
+therefore remain pending, while a blocked model or stopped verifier still times
+out. Synchronous verification sends the standard MCP cancellation notification
+when its plan is canceled and releases the Atlas channel. No verifier status
+or cancel capability is required. `passed=true` preserves the original
+successful result. `passed=false` changes the original
 node to `FAILED` with `result verification failed: ...`; an unavailable,
 timed-out, or malformed verifier response changes it to `FAILED` with
 `result verification unavailable: ...`. Failed, cancelled, and timed-out

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MulanPSL-2.0
 """MCP service and standard Robonix lifecycle entry point."""
 import logging
+import asyncio
 
 from robonix_api import Err, Ok, Service, scribe_logger
 from verifier_mcp import Verify_Request, Verify_Response
@@ -19,9 +20,11 @@ _config = None
 @service.on_init
 def init(cfg: dict):
     """Validate configuration without acquiring a camera or calling the model."""
-    global _config
+    global _config, CAMERAS
     try:
         _config = vlm.VlmConfig.parse(cfg.get("vlm"))
+        CAMERAS.close()
+        CAMERAS = camera.CameraPool(lambda: ATLAS, service.id, cfg.get("reference"))
     except (ValueError, TypeError) as exc:
         _config = None
         return Err(str(exc))
@@ -36,9 +39,18 @@ async def verify(req: Verify_Request) -> Verify_Response:
         raise RuntimeError("VLM Verifier is not initialized")
 
     async def observe(provider_id):
-        jpeg = await CAMERAS.capture(provider_id)
+        async def on_wait(reading):
+            context = service._mcp_app.get_context()
+            await context.request_context.session.send_log_message(
+                "debug", {"call_id": req.call_id, "reference": list(reading)},
+                logger="vlm_verifier.camera", related_request_id=context.request_id,
+            )
+
+        jpeg = await CAMERAS.capture(provider_id, on_wait=on_wait)
         try:
-            path = camera.save_verification_frame(req.call_id, jpeg)
+            path = await asyncio.wait_for(
+                asyncio.to_thread(camera.save_verification_frame, req.call_id, jpeg), 5,
+            )
         except OSError as exc:
             log.warning("call_id=%r could not save verification frame (%s)",
                         req.call_id, type(exc).__name__)
@@ -49,7 +61,8 @@ async def verify(req: Verify_Request) -> Verify_Response:
     async def evaluate(envelope, jpeg):
         return await vlm.judge(config, envelope, jpeg)
 
-    result = await core.verify(req.call_id, req.args_json, observe, evaluate)
+    result = await core.verify(req.call_id, req.args_json, observe, evaluate,
+                               reference=CAMERAS._reference.read)
     return Verify_Response(**result)
 
 
