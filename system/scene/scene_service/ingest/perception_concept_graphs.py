@@ -7,7 +7,7 @@ import logging
 import math
 import os
 import threading
-import time
+from scene_service import clock
 
 from .geometry_gates import KnownGround, fraction_on_known_ground
 import uuid
@@ -657,9 +657,15 @@ class ConceptGraphsDetector:
 
         # uuid → registry object_id binding (see _apply_snapshot).
         self._uuid_to_oid: dict[str, str] = {}
-        # (rgb, {track_id: xyxy}, camera xy, wall time) of the last frame that
+        # (rgb, {track_id: xyxy}, camera xy) of the last frame that
         # matched detections: the photographs are cut from these boxes.
         self._seen = None
+        self._seen_reference = None
+        self._reference_frame = None
+        self._reference_tick = None
+        self._last_frame_message = None
+        self._sampling = clock._ReferenceSampling()
+        self._reset_count = 0
         self._tick_boxes: dict = {}
         # Per-track side tables keyed by the ConceptGraphs object uuid.
         self._bank: dict[Any, list[tuple[Any, float]]] = {}      # (feat, area)
@@ -756,13 +762,13 @@ class ConceptGraphsDetector:
     # Read by the rerun viewer tick and /api/objects3d.
     def export_3d_snapshot(self, max_points_per_obj: int = 256) -> dict:
         if self._map_objects is None:
-            return {"objects": [], "stamp_unix": time.time()}
+            return {"objects": [], "stamp_unix": clock.time()}
         out = []
         # No inference lock: it can be held ~100 ms by the YOLO/SAM worker.
         try:
             map_objs = list(self._map_objects)
         except Exception:
-            return {"objects": [], "stamp_unix": time.time()}
+            return {"objects": [], "stamp_unix": clock.time()}
         # Filter to only objects that have made it into the registry —
         # `_uuid_to_oid` is the cache `_apply_snapshot` populates, so this is
         # the same set the 2D web UI / MCP API see.
@@ -853,7 +859,7 @@ class ConceptGraphsDetector:
                 })
             except Exception:  # noqa: BLE001
                 continue
-        return {"objects": out, "stamp_unix": time.time()}
+        return {"objects": out, "stamp_unix": clock.time()}
 
     # ── frame bundle (for the scene-graph image relation pass) ────────
     def latest_depth_metres(self):
@@ -875,9 +881,12 @@ class ConceptGraphsDetector:
         so the photograph shows what the label was given to.
         """
         seen = getattr(self, "_seen", None)
-        if seen is None or time.time() - seen[3] > max_age_s:
+        if seen is None:
             return None
-        rgb, boxes, cam_xy, _ = seen
+        receipt = getattr(self, "_seen_reference", None)
+        if receipt is None or clock.reference_age(*receipt) > max_age_s:
+            return None
+        rgb, boxes, cam_xy = seen
         out = []
         for track_id, xyxy in boxes.items():
             oid = self._uuid_to_oid.get(track_id)
@@ -913,27 +922,48 @@ class ConceptGraphsDetector:
     async def _loop(self) -> None:
         loop = asyncio.get_running_loop()
         while not self._stop.is_set():
-            t0 = time.monotonic()
             try:
-                await loop.run_in_executor(None, self._tick_once)
-            except Exception as e:  # noqa: BLE001
-                log.exception("cg tick error: %s", e)
-            elapsed = time.monotonic() - t0
+                t0 = clock.monotonic()
+                try:
+                    await loop.run_in_executor(None, self._tick_once)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("cg tick error: %s", e)
+                elapsed = clock.monotonic() - t0
+            except OSError:
+                await asyncio.sleep(self._period_s)
+                continue
             await asyncio.sleep(max(0.0, self._period_s - elapsed))
 
     def _tick_once(self) -> None:
         with self._inference_lock:
-            t0 = time.monotonic()
+            t0 = clock.monotonic()
+            self._reference_tick = None
+            self._tick_reset_count = self._reset_count
             try:
+                self._reference_tick = clock.reference_time()
                 self._tick_locked()
             finally:
+                try:
+                    current = clock.reference_time()
+                    interrupted = (self._reference_tick is None
+                                   or self._reference_tick.generation != current.generation
+                                   or self._tick_reset_count != self._reset_count)
+                except OSError:
+                    interrupted = True
+                if interrupted:
+                    self._clear_derived_state_locked()
                 # Timed here rather than inside, so the figure covers the whole
                 # pass and is recorded even when the pass raises.
-                self.last_tick_s = time.monotonic() - t0
+                self.last_tick_s = clock.monotonic() - t0
 
     def _tick_locked(self) -> None:
         rgb_msg = self._rgb_msg()
         depth_msg = self._depth_msg()
+        self._reference_frame = self._hub.reference_receipt("rgb", rgb_msg) if rgb_msg is not None else None
+        if rgb_msg is not None and self._reference_frame is None:
+            return
+        if rgb_msg is not None and rgb_msg is self._last_frame_message:
+            return
         if rgb_msg is None or depth_msg is None:
             # One-line diagnostic so "no ticks at all" stops looking like a
             # silent crash.
@@ -948,6 +978,8 @@ class ConceptGraphsDetector:
             self._tick_idx += 1
             if self._tick_idx % 25 == 1:
                 log.info("[scene-cg] waiting for camera intrinsics")
+            return
+        if not self._sampling.admit(self._reference_tick, self._period_s):
             return
         try:
             import torch
@@ -974,10 +1006,12 @@ class ConceptGraphsDetector:
             log.warning("yolo-world predict failed: %s", e)
             return
         if not yolo_results:
+            self._last_frame_message = rgb_msg
             return
         r0 = yolo_results[0]
         boxes = getattr(r0, "boxes", None)
         if boxes is None or len(boxes) == 0:
+            self._last_frame_message = rgb_msg
             self._tick_idx += 1
             self._maybe_periodic_cleanup()
             return
@@ -1015,6 +1049,7 @@ class ConceptGraphsDetector:
             for cidx in cls_idx
         ], dtype=bool)
         if not keep.any():
+            self._last_frame_message = rgb_msg
             self._tick_idx += 1
             self._maybe_periodic_cleanup()
             return
@@ -1031,6 +1066,7 @@ class ConceptGraphsDetector:
             log.warning("mobile-sam predict failed: %s — skipping tick", e)
             return
         if not sam_results or getattr(sam_results[0], "masks", None) is None:
+            self._last_frame_message = rgb_msg
             log.debug("mobile-sam returned no masks")
             return
         masks_t = sam_results[0].masks.data
@@ -1043,6 +1079,7 @@ class ConceptGraphsDetector:
             confs = confs[:n]
             cls_idx = cls_idx[:n]
         if masks.shape[0] == 0:
+            self._last_frame_message = rgb_msg
             return
 
         # Resize masks to depth resolution if needed (MobileSAM masks come back
@@ -1218,6 +1255,7 @@ class ConceptGraphsDetector:
             det_list.append(d)
 
         if len(det_list) == 0:
+            self._last_frame_message = rgb_msg
             self._tick_idx += 1
             self._maybe_periodic_cleanup()
             return
@@ -1361,11 +1399,13 @@ class ConceptGraphsDetector:
 
         if self._tick_boxes:
             self._seen = (rgb, dict(self._tick_boxes),
-                          (float(trans_pose[0, 3]), float(trans_pose[1, 3])), time.time())
+                          (float(trans_pose[0, 3]), float(trans_pose[1, 3])))
+            self._seen_reference = self._reference_frame
         self._update_visible_absence(depth=depth, K=K, trans_pose=trans_pose)
         self._tick_idx += 1
         self._maybe_periodic_cleanup()
         self._project_to_registry()
+        self._last_frame_message = rgb_msg
 
     def _update_visible_absence(self, *, depth, K, trans_pose) -> None:
         """Remove map objects whose old location is verifiably empty."""
@@ -1771,10 +1811,11 @@ class ConceptGraphsDetector:
             if not self._hub.has(kind):
                 continue
             msg, stamp_unix, _count = self._hub.latest(kind)
-            if msg is None or stamp_unix <= 0:
+            if msg is None:
                 continue
             max_age_s = float(getattr(self, "_pose_max_age_s", 0.0) or 0.0)
-            if max_age_s > 0.0 and time.time() - stamp_unix > max_age_s:
+            age = self._hub.age(kind, msg)
+            if age is None or (max_age_s > 0.0 and age > max_age_s):
                 continue
             world_frame = str(
                 getattr(getattr(msg, "header", None), "frame_id", "") or ""
@@ -1848,7 +1889,7 @@ class ConceptGraphsDetector:
         ):
             return None
         msg, stamp_unix, _count = self._hub.latest("camera_extrinsics")
-        if msg is None or stamp_unix <= 0:
+        if msg is None:
             return None
         parent_frame = str(
             getattr(getattr(msg, "header", None), "frame_id", "") or ""
@@ -2056,6 +2097,7 @@ class ConceptGraphsDetector:
                 conf_list = obj.get("conf", [])
                 conf = float(np.mean(conf_list)) if conf_list else 0.5
                 snapshots.append({
+                    "_reference_receipt": self._reference_frame,
                     # The MapObjectList entry's stable uuid — this is the key
                     # the registry uses to decide insert vs. update vs. evict,
                     # so identifiers stop churning.
@@ -2076,17 +2118,31 @@ class ConceptGraphsDetector:
 
         # Schedule the registry mutation on the asyncio loop so it
         # serializes with the snapshot reader (same asyncio.Lock).
+        reference = self._reference_tick
+        reset_count = self._tick_reset_count
+        if reference is None:
+            return
+
+        async def apply_current_snapshot():
+            try:
+                if reference.generation != clock.reference_time().generation:
+                    return
+            except OSError:
+                return
+            await self._apply_snapshot(snapshots, reference=reference, reset_count=reset_count)
+
         try:
             asyncio.run_coroutine_threadsafe(
-                self._apply_snapshot(snapshots), self._asyncio_loop,
+                apply_current_snapshot(), self._asyncio_loop,
             )
         except Exception as e:  # noqa: BLE001
             log.debug("schedule registry update failed: %s", e)
 
-    async def _apply_snapshot(self, snapshots: list[dict]) -> None:
+    async def _apply_snapshot(self, snapshots: list[dict], *, reference=None, reset_count=None) -> None:
         """Reconcile concept-graphs MapObjectList state into the registry
         **incrementally**."""
-        now = time.time()
+        now = clock.time()
+        reference = reference or clock.reference_time()
         # A rejected snapshot below is not evidence that its object is gone:
         # visible absence decides that. Its uuid stays live, so a registered
         # object is neither updated nor evicted while the gate rejects it.
@@ -2107,6 +2163,9 @@ class ConceptGraphsDetector:
                 log.info("[scene-cg] %d object(s) stand on unmapped ground; not registered", dropped)
             snapshots = kept
         async with self._registry.lock():
+            if (reset_count is not None and reset_count != self._reset_count
+                    or reference.generation != clock.reference_time().generation):
+                return
             wf = self._world_frame_fn()
             if not wf:
                 log.warning(
@@ -2118,6 +2177,9 @@ class ConceptGraphsDetector:
             adopted_oids: set[str] = set()
             # Bind / adopt / insert FIRST; eviction runs after.
             for s in snapshots:
+                receipt = s.get("_reference_receipt") or (reference.timestamp_ns, reference.generation)
+                if receipt[1] != reference.generation:
+                    continue
                 u = s.get("uuid", "")
                 pose = Pose3D(
                     x=s["x"], y=s["y"], z=s["z"],
@@ -2177,6 +2239,7 @@ class ConceptGraphsDetector:
                         existing.bbox = bbox
                     existing.confidence = max(0.0, min(1.0, s["confidence"]))
                     existing.last_seen = now
+                    existing._reference_receipt = receipt
                     existing.missing = False
                     existing.observation_count += 1
                     adopted_oids.add(existing.object_id)
@@ -2189,6 +2252,7 @@ class ConceptGraphsDetector:
                         now=now,
                         source="concept_graphs",
                     )
+                    obj._reference_receipt = receipt
                     # insert_object seeds observation_count=1; it is
                     # registry-owned from here (see the += 1 on re-sighting).
                     if u:
@@ -2283,19 +2347,31 @@ class ConceptGraphsDetector:
 
     async def reset_derived_state(self) -> None:
         """Empty the CG map and uuid bindings (flush)."""
-        if hasattr(self, "_uuid_to_oid"):
-            self._uuid_to_oid.clear()
-
+        self._reset_count += 1
         def _reset() -> None:
             with self._inference_lock:
-                if self._map_objects is None:
-                    return
-                if self._cg is not None:
-                    self._map_objects = self._cg["MapObjectList"]()
-                else:
-                    self._map_objects = []
+                self._clear_derived_state_locked()
 
         await asyncio.to_thread(_reset)
+
+    def _clear_derived_state_locked(self) -> None:
+        if hasattr(self, "_uuid_to_oid"):
+            self._uuid_to_oid.clear()
+        self._seen = None
+        self._seen_reference = None
+        self._reference_tick = None
+        self._reference_frame = None
+        self._last_frame_message = None
+        self._sampling = clock._ReferenceSampling()
+        for table in (self._bank, self._max_area, self._label_hist, self._vox):
+            table.clear()
+        self._tick_boxes.clear()
+        if self._map_objects is None:
+            return
+        if self._cg is not None:
+            self._map_objects = self._cg["MapObjectList"]()
+        else:
+            self._map_objects = []
 
     def _rebind_restored(self, label: str, pose: Pose3D) -> Optional[SceneObject]:
         """Nearest warm-restored, not-yet-rebound object of class `label` whose

@@ -558,8 +558,9 @@ def test_geometric_loop_debounce():
     """Debounce band: 2 present ticks to emit, 1 grace tick on dropout."""
     from scene_service.scene_graph.geometric_loop import GeometricRelationLoop
     from scene_service.scene_graph.types import SceneGraphEdge
+    from types import SimpleNamespace
 
-    loop = GeometricRelationLoop(registry=None, store=None)
+    loop = GeometricRelationLoop(registry=None, store=SimpleNamespace(_reset_count=0))
     e = SceneGraphEdge("a", "b", "on_top_of", 0.95, "geometric")
 
     assert loop._debounce([e]) == []                       # score 1 → hold

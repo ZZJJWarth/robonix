@@ -14,6 +14,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from scene_service.state.object_registry import BBox3D, ObjectRegistry, Pose3D
+from scene_service import clock
 
 
 # ── registry-level helpers ────────────────────────────────────────────────
@@ -22,7 +23,7 @@ def _insert(reg: ObjectRegistry, label: str, xyz, *, now: float):
     """Insert a perception object at `xyz` and return it (test helper).
 
     Bypasses the asyncio lock — single-threaded test, no contention."""
-    return reg.insert_object(
+    obj = reg.insert_object(
         label,
         Pose3D(*xyz),
         BBox3D(0.2, 0.2, 0.2),
@@ -30,6 +31,12 @@ def _insert(reg: ObjectRegistry, label: str, xyz, *, now: float):
         now=now,
         source="concept_graphs",
     )
+    reference = clock.reference_time()
+    obj._reference_receipt = (
+        reference.timestamp_ns - int((clock.time() - now) * 1_000_000_000),
+        reference.generation,
+    )
+    return obj
 
 
 def test_find_rebindable():
@@ -187,9 +194,12 @@ def test_apply_snapshot_ttl_prune():
     run(det._apply_snapshot([_snap("u1", "keyboard", (1.0, 0.0, 0.7))]))
     oid = next(o.object_id for o in reg.all_objects() if o.label == "keyboard")
 
-    # Soft-evict, then backdate last_seen past the TTL.
+    # Soft-evict, then backdate the reference receipt past the TTL.
     run(det._apply_snapshot([]))
-    reg.get_object(oid).last_seen = time.time() - 100.0
+    reference = clock.reference_time()
+    reg.get_object(oid)._reference_receipt = (
+        reference.timestamp_ns - 100_000_000_000, reference.generation,
+    )
 
     # Next reconcile runs prune_expired → record is gone.
     run(det._apply_snapshot([]))
@@ -276,13 +286,15 @@ def test_photographs_come_from_the_detectors_own_boxes():
     det._uuid_to_oid = {"u1": "scene.object.0007"}
     rgb = np.zeros((480, 640, 3), dtype=np.uint8)
     det._seen = (rgb, {"u1": [10.4, 20.6, 110.0, 220.0], "gone": [0, 0, 5, 5]},
-                 (1.0, 2.0), time.time())
+                 (1.0, 2.0))
+    reference = clock.reference_time()
+    det._seen_reference = (reference.timestamp_ns, reference.generation)
 
     frame, boxes, cam_xy = det.latest_detection_views()
     assert frame is rgb and cam_xy == (1.0, 2.0)
     assert boxes == [("scene.object.0007", (10, 21, 110, 220))]
 
-    det._seen = det._seen[:3] + (time.time() - 60.0,)
+    det._seen_reference = (reference.timestamp_ns - 60_000_000_000, reference.generation)
     assert det.latest_detection_views() is None
 
 

@@ -43,6 +43,7 @@ def _extrinsics(parent="fixture_base", child="fixture_camera"):
 
 class _Hub:
     def __init__(self, *, pose=None, extrinsics=None, pose_age_s=0.0):
+        self.pose_age_s = pose_age_s
         now = time.time()
         self._slots = {
             "pose": (pose, now - pose_age_s if pose is not None else 0.0, 1),
@@ -58,6 +59,11 @@ class _Hub:
 
     def latest(self, kind):
         return self._slots.get(kind, (None, 0.0, 0))
+
+    def age(self, kind, message=None):
+        if self.latest(kind)[0] is None:
+            return None
+        return self.pose_age_s if kind == "pose" else 0.0
 
     def lookup_transform_4x4(self, _target_frame, _source_frame, _stamp=None):
         """Make the TF-first path explicitly unavailable in this fixture."""

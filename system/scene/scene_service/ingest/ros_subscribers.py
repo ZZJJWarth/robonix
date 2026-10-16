@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Any
 
@@ -105,21 +105,55 @@ def topic_qos_policy(spec: TopicSpec) -> tuple[str, str, int]:
 class _LatestSlot:
     """The latest message on one topic, written by rclpy callbacks."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reference_sensitive: bool = True) -> None:
         self._lock = threading.Lock()
         self._msg: Any = None
         self._stamp_unix: float = 0.0
         self._count: int = 0
+        self._reference: tuple[int, int] | None = None
+        self._reference_sensitive = reference_sensitive
 
     def write(self, msg: Any) -> None:
         with self._lock:
+            try:
+                reference = clock.reference_time() if self._reference_sensitive else None
+                stamp_unix = clock.time()
+            except OSError:
+                return
             self._msg = msg
-            self._stamp_unix = time.time()
+            self._stamp_unix = stamp_unix
             self._count += 1
+            self._reference = (reference.timestamp_ns, reference.generation) if reference is not None else None
 
     def read(self) -> tuple[Any, float, int]:
         with self._lock:
+            if self._reference_sensitive and self._reference is not None:
+                try:
+                    if clock.reference_age(*self._reference) == float("inf"):
+                        return None, 0.0, self._count
+                except OSError:
+                    return None, 0.0, self._count
             return self._msg, self._stamp_unix, self._count
+
+    def age(self, message=None) -> float | None:
+        with self._lock:
+            if self._reference is None or (message is not None and message is not self._msg):
+                return None
+            return clock.reference_age(*self._reference)
+
+    def reference_receipt(self, message=None) -> tuple[int, int] | None:
+        with self._lock:
+            if message is not None and message is not self._msg:
+                return None
+            return self._reference
+
+    def clear(self) -> None:
+        if not self._reference_sensitive:
+            return
+        with self._lock:
+            self._msg = None
+            self._stamp_unix = 0.0
+            self._reference = None
 
 
 class SubscribersHub:
@@ -128,7 +162,10 @@ class SubscribersHub:
     def __init__(self, specs: list[TopicSpec], *, node_name: str = "scene_subscribers") -> None:
         self.specs = specs
         self.node_name = node_name
-        self._slots: dict[str, _LatestSlot] = {s.kind: _LatestSlot() for s in specs}
+        self._slots: dict[str, _LatestSlot] = {
+            s.kind: _LatestSlot(reference_sensitive=s.kind not in {"intrinsics", "camera_extrinsics"})
+            for s in specs
+        }
         self._ros: dict[str, Any] | None = None
         self._node: Any = None
         self._spin_thread: threading.Thread | None = None
@@ -172,7 +209,7 @@ class SubscribersHub:
             return False
         if spec.kind in self._slots:
             return False
-        self._slots[spec.kind] = _LatestSlot()
+        self._slots[spec.kind] = _LatestSlot(reference_sensitive=spec.kind not in {"intrinsics", "camera_extrinsics"})
         if not self._subscribe(spec):
             del self._slots[spec.kind]
             return False
@@ -276,6 +313,20 @@ class SubscribersHub:
 
     def has(self, kind: str) -> bool:
         return kind in self._slots
+
+    def age(self, kind: str, message=None) -> float | None:
+        slot = self._slots.get(kind)
+        return slot.age(message) if slot is not None else None
+
+    def clear_runtime_samples(self) -> None:
+        for slot in self._slots.values():
+            slot.clear()
+        if self._tf_buffer is not None:
+            self._tf_buffer.clear()
+
+    def reference_receipt(self, kind: str, message=None) -> tuple[int, int] | None:
+        slot = self._slots.get(kind)
+        return slot.reference_receipt(message) if slot is not None else None
 
     # ── tf2 accessors ────────────────────────────────────────────────────
     def lookup_transform_4x4(

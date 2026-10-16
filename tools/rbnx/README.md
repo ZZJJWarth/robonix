@@ -140,6 +140,11 @@ The enclosing 180-second primitive and skill bring-up budgets also use
 reference time in ROS time deployments. Soma process exit and readiness queries
 retain real failure checks, so pausing does not hide a dead process or a broken connection.
 
+When booting `system.scene`, `rbnx` copies this choice and the Chronos provider
+id into Scene's `reference` runtime config. An explicit Scene reference must
+match that choice. Scene package codegen must include the `reference_time`
+contract, and its Python environment needs the updated Chronos clock wheel.
+
 For example, this enables Vitals without a separate terminal or global
 `RUST_LOG` setting:
 

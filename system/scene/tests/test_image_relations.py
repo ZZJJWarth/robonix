@@ -254,9 +254,17 @@ def test_builder_dispatch():
             sem = store.get_semantic_edges()
             assert len(sem) == 1 and sem[0].stale_rounds == 0
 
-            # A real attempted failure advances normal bounded hysteresis once.
+            # A failed inference on a later observation ages the edge once.
             fake_inferer.result = ImageRelationResult((), "failed")
-            loop.run_until_complete(builder.rebuild_once())
+            from unittest.mock import patch
+            from types import SimpleNamespace
+            from scene_service import clock
+            reading = clock.reference_time()
+            later = SimpleNamespace(timestamp_ns=reading.timestamp_ns + 31_000_000_000,
+                                    generation=reading.generation)
+            registry._objects["scene.object.0001"].observation_count += 1
+            with patch.object(clock, "reference_time", return_value=later):
+                loop.run_until_complete(builder.rebuild_once())
             sem = store.get_semantic_edges()
             assert len(sem) == 1 and sem[0].stale_rounds == 1
 

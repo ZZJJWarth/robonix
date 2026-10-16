@@ -80,6 +80,9 @@ class _FakeHub:
         self.latest_calls.append(kind)
         return self.samples[kind], time.time(), 1
 
+    def age(self, kind, message=None):
+        return 0.0 if kind in self.samples else None
+
 
 def _detector(
     hub: _FakeHub,

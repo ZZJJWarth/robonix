@@ -51,6 +51,7 @@ dependencies = [
     # transitively (via memsearch), without an explicit pin.
     "pymilvus!=2.6.10,>=2.5.0",
     "robonix-api",
+    "robonix-chronos-clock==1.1.0b1",
 ]
 
 # This package is the service itself; `uv sync` only needs to install
@@ -61,3 +62,4 @@ package = false
 # Resolved through the workspace at the repo root (see /pyproject.toml).
 [tool.uv.sources]
 robonix-api = { workspace = true }
+robonix-chronos-clock = { workspace = true }

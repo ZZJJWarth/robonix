@@ -16,6 +16,8 @@ the JSON will grow an `occupancy:` field that the canvas overlays).
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
+import threading
 import math
 import base64
 import io
@@ -24,7 +26,7 @@ import json
 import logging
 import os
 import re
-import time
+from scene_service import clock
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Optional
@@ -212,16 +214,30 @@ def _camera_channel_payload(hub: Any, kind: str) -> Optional[dict]:
         return cache["payload"]
 
     payload = _image_to_png_b64(msg, kind=kind)
-    if payload is not None and payload["stamp_ms"] == 0:
+    if payload is not None and getattr(getattr(msg, "header", None), "stamp", None) is None:
         payload["stamp_ms"] = int(stamp_unix * 1000)
+    if payload is not None:
+        if hub.latest(kind)[0] is not msg:
+            return None
+        payload["count"] = count
     _CAMERA_CACHE[kind] = {"hub": hub, "count": count, "payload": payload}
     return payload
 
 
 def _camera_payload(hub: Any) -> dict:
     """The latest RGB and depth previews."""
-    return {kind: _camera_channel_payload(hub, kind) if hub is not None
-            else None for kind in ("rgb", "depth")}
+    result = {}
+    for kind in ("rgb", "depth"):
+        payload = _camera_channel_payload(hub, kind) if hub is not None else None
+        if payload is not None:
+            try:
+                age = hub.age(kind)
+            except OSError:
+                age = None
+            payload = {**payload, "age_ms": None if age is None or not math.isfinite(age) else age * 1000,
+                       "stale": age is None or age > 2.0}
+        result[kind] = payload
+    return result
 
 
 def _camera_json_bytes(hub: Any) -> bytes:
@@ -307,7 +323,7 @@ def _state_payload(registry: ObjectRegistry,
         "occupancy": occupancy_payload(hub),
         "annotations": regions,
         "map_binding": map_binding,
-        "stamp_unix": time.time(),
+        "stamp_unix": clock.time(),
     }
 
 
@@ -322,6 +338,22 @@ _MAP_OPS = ("list_maps", "save_map", "load_map", "delete_map",
             "pose_estimate", "get_pose", "get_mode")
 
 
+_map_operation = ContextVar("map_operation", default=None)
+
+
+def _check_map_operation():
+    operation = _map_operation.get()
+    if operation is None:
+        return
+    canceled, started = operation
+    if canceled.is_set():
+        raise RuntimeError("map request canceled")
+    reading = clock.reference_time()
+    if (reading.generation != started.generation
+            or reading.timestamp_ns < started.timestamp_ns):
+        raise RuntimeError("Chronos reference generation changed or moved backwards during map request")
+
+
 def _map_rpc(op: str, payload: Optional[dict] = None, timeout_s: float = 20.0) -> dict:
     """Call one robonix/service/map operation through Atlas and gRPC; the
     response's set fields as a dict, or {ok: False, detail}."""
@@ -330,6 +362,7 @@ def _map_rpc(op: str, payload: Optional[dict] = None, timeout_s: float = 20.0) -
     import robonix_contracts_pb2_grpc as contracts_grpc  # type: ignore
 
     assert op in _MAP_OPS, op
+    _check_map_operation()
     method_name = "".join(part.title() for part in op.split("_"))
     contract_id = f"robonix/service/map/{op}"
     stub_name = f"RobonixServiceMap{method_name}Stub"
@@ -345,13 +378,44 @@ def _map_rpc(op: str, payload: Optional[dict] = None, timeout_s: float = 20.0) -
         transport="grpc",
     )
     try:
+        _check_map_operation()
         endpoint = (channel_ref.endpoint or "").strip()
         if not endpoint:
             return {"ok": False, "detail": f"{contract_id} resolved to an empty endpoint"}
-        with grpc.insecure_channel(endpoint) as grpc_channel:
+        with grpc.insecure_channel(endpoint, options=(
+            ("grpc.keepalive_time_ms", 2000),
+            ("grpc.keepalive_timeout_ms", 2000),
+            ("grpc.http2.max_pings_without_data", 0),
+        )) as grpc_channel:
+            grpc.channel_ready_future(grpc_channel).result(timeout=5.0)
             stub = getattr(contracts_grpc, stub_name)(grpc_channel)
             req = getattr(map_pb2, req_name)(**(payload or {}))
-            resp = getattr(stub, method_name)(req, timeout=timeout_s)
+            method = getattr(stub, method_name)
+            _check_map_operation()
+            operation = _map_operation.get()
+            metadata = (("robonix-reference-generation", str(operation[1].generation)),) if operation else ()
+            if op not in ("save_map", "load_map", "get_pose"):
+                resp = method(req, timeout=timeout_s, metadata=metadata)
+            else:
+                started = clock.reference_time()
+                call = method.future(req, metadata=metadata or (
+                    ("robonix-reference-generation", str(started.generation)),))
+                try:
+                    while True:
+                        _check_map_operation()
+                        reading = clock.reference_time()
+                        if (reading.generation != started.generation
+                                or reading.timestamp_ns < started.timestamp_ns):
+                            raise RuntimeError("Chronos reference changed during map RPC")
+                        if (reading.timestamp_ns - started.timestamp_ns) / 1e9 >= timeout_s:
+                            raise TimeoutError("map RPC exceeded its reference budget")
+                        try:
+                            resp = call.result(timeout=0.1)
+                            break
+                        except grpc.FutureTimeoutError:
+                            continue
+                finally:
+                    call.cancel()
         return {field.name: value for field, value in resp.ListFields()}
     except grpc.RpcError as e:
         return {"ok": False, "detail": f"{contract_id} rpc failed: {e.code().name}: {e.details()}"}
@@ -805,6 +869,7 @@ def make_app(*, registry: ObjectRegistry,
             object_store.load_all, partition=partition, strict=True
         )
         async with registry.lock():
+            _check_map_operation()
             for o in restored:
                 registry.restore_object(o)
         return len(restored)
@@ -964,6 +1029,36 @@ def make_app(*, registry: ObjectRegistry,
                 return True, item
         return False, {}
 
+    async def _run_map_operation(request, run):
+        canceled = threading.Event()
+        try:
+            started = clock.reference_time()
+        except OSError as exc:
+            return _anno_error(503, str(exc))
+        token = _map_operation.set((canceled, started))
+
+        async def watch_disconnect():
+            while not canceled.is_set():
+                if await request.is_disconnected():
+                    canceled.set()
+                    return
+                await asyncio.sleep(0.1)
+
+        watcher = asyncio.create_task(watch_disconnect())
+        try:
+            _check_map_operation()
+            response = await run()
+            _check_map_operation()
+            return response
+        except (RuntimeError, OSError) as exc:
+            semantic_hold["reason"] = f"map request interrupted: {exc}"
+            return _anno_error(502, str(exc))
+        finally:
+            canceled.set()
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            _map_operation.reset(token)
+
     async def _map_request(request, locked_op, *, reserved_check=False):
         """Parse `{map_id, ...}` and run `locked_op(map_id, body)` under
         `ops_lock`, which serialises Save/Load/Delete with the lifecycle
@@ -978,8 +1073,25 @@ def make_app(*, registry: ObjectRegistry,
             reserved = _reserved_map_id_error(map_id)
             if reserved is not None:
                 return reserved
-        async with ops_lock:
-            return await locked_op(map_id, body)
+        if locked_op not in (_maps_save_locked, _maps_load_locked):
+            async with ops_lock:
+                return await locked_op(map_id, body)
+
+        async def run_locked():
+            while True:
+                _check_map_operation()
+                try:
+                    await asyncio.wait_for(ops_lock.acquire(), timeout=0.1)
+                    break
+                except asyncio.TimeoutError:
+                    continue
+            try:
+                _check_map_operation()
+                return await locked_op(map_id, body)
+            finally:
+                ops_lock.release()
+
+        return await _run_map_operation(request, run_locked)
 
     async def maps_save(request) -> JSONResponse:
         return await _map_request(request, _maps_save_locked,
@@ -1033,6 +1145,7 @@ def make_app(*, registry: ObjectRegistry,
             )
         object_count = 0
         object_persist_error = None
+        _check_map_operation()
         if out.get("ok"):
             gen, broadcast_mode = _latched_lifecycle(map_id)
             if anno_store is not None:
@@ -1051,6 +1164,7 @@ def make_app(*, registry: ObjectRegistry,
                             f"snapshot incomplete: {written}/{expected} rows written"
                         )
                     object_count = written
+                    _check_map_operation()
                     map_meta.write(make_meta(
                         map_id, partition, seq,
                         generation=gen, mode=broadcast_mode,
@@ -1084,6 +1198,7 @@ def make_app(*, registry: ObjectRegistry,
                     log.warning("[scene-maps] no preview for %s: %s", map_id, error)
             mode_after_save = current_mode if spatial_exists and current_bound_id == map_id and current_mode else "mapping"
             photos_were = object_views.partition(map_binding) if object_views else None
+            _check_map_operation()
             _set_map_binding(map_id, mode_after_save, "ui_save", generation=gen)
             if object_views is not None:
                 # A saved session's pictures follow it to the map id.
@@ -1146,10 +1261,9 @@ def make_app(*, registry: ObjectRegistry,
     async def _maps_load_locked(map_id: str, body: dict) -> JSONResponse:
         mode = str(body.get("mode") or "localization")
         load_timeout_s = float(os.environ.get("SCENE_MAP_LOAD_TIMEOUT_S", "240"))
-        before_stamp = 0.0
-        before_count = 0
+        before_msg = None
         if hub is not None and hub.has("occupancy_grid"):
-            _before_msg, before_stamp, before_count = hub.latest("occupancy_grid")
+            before_msg, _stamp, _count = hub.latest("occupancy_grid")
         out = await asyncio.to_thread(_map_rpc, "load_map", {
             "map_id": map_id,
             "mode": mode,
@@ -1158,22 +1272,37 @@ def make_app(*, registry: ObjectRegistry,
             "y": float(body.get("y") or 0.0),
             "theta": float(body.get("theta") or 0.0),
         }, load_timeout_s)
+        _check_map_operation()
         if out.get("ok"):
             # Until every rebind below commits, Save is held off; only full
             # success clears the hold.
             semantic_hold["reason"] = f"the last load of {map_id} did not complete"
             # Restore semantic state only once the loaded map's grid arrives.
             ready_timeout_s = float(os.environ.get("SCENE_MAP_READY_TIMEOUT_S", "20"))
-            deadline = time.monotonic() + ready_timeout_s
+            started = None
             occupancy_ready = False
-            while time.monotonic() < deadline:
+            wait_error = None
+            while True:
+                _check_map_operation()
+                try:
+                    reading = clock.reference_time()
+                except OSError as error:
+                    wait_error = str(error)
+                    break
+                if started is None:
+                    started = reading
+                if reading.generation != started.generation:
+                    wait_error = "Chronos reference generation changed during map load"
+                    break
+                if (reading.timestamp_ns - started.timestamp_ns) / 1_000_000_000 >= ready_timeout_s:
+                    break
                 if hub is not None and hub.has("occupancy_grid"):
                     msg, stamp, count = hub.latest("occupancy_grid")
                     if (
                         msg is not None
                         and int(getattr(msg.info, "width", 0)) > 0
                         and int(getattr(msg.info, "height", 0)) > 0
-                        and (count > before_count or stamp > before_stamp)
+                        and msg is not before_msg
                     ):
                         occupancy_ready = True
                         out["occupancy"] = {
@@ -1192,9 +1321,9 @@ def make_app(*, registry: ObjectRegistry,
                 out = {
                     **out,
                     "ok": False,
-                    "detail": (
+                    "detail": wait_error or (
                         f"mapping loaded {map_id}, but Scene did not observe a new "
-                        f"occupancy grid within {ready_timeout_s:.1f}s"
+                        f"occupancy grid within {ready_timeout_s:.1f}s of reference time"
                     ),
                 }
                 return JSONResponse(out, status_code=502)
@@ -1204,6 +1333,7 @@ def make_app(*, registry: ObjectRegistry,
                 registry_lock = getattr(registry, "lock", None)
                 if callable(registry_lock):
                     async with registry_lock():
+                        _check_map_operation()
                         flushed = registry.clear_objects()
                 else:
                     flushed = registry.clear_objects()
@@ -1251,6 +1381,7 @@ def make_app(*, registry: ObjectRegistry,
                         ),
                     }
                     return JSONResponse(out, status_code=502)
+            _check_map_operation()
             if anno_store is not None:
                 anno_gen = gen if gen is not None else (
                     meta.mapping_generation if meta is not None else None
@@ -1338,6 +1469,9 @@ def make_app(*, registry: ObjectRegistry,
         body = await _anno_body(request)
         if body is None:
             return _anno_error(400, "request body must be a JSON object")
+        return await _run_map_operation(request, lambda: _maps_pose_estimate(body))
+
+    async def _maps_pose_estimate(body) -> JSONResponse:
         try:
             payload = {
                 "x": float(body.get("x")),
@@ -1363,9 +1497,14 @@ def make_app(*, registry: ObjectRegistry,
 
         mode_info = await asyncio.to_thread(_map_rpc, "get_mode", {}, 3.0)
         before = await asyncio.to_thread(_map_rpc, "get_pose", {}, 3.0)
+        _check_map_operation()
         out = await asyncio.to_thread(_map_rpc, "pose_estimate", payload)
         # Give relocalisation a moment, so the reply can show convergence.
-        await asyncio.sleep(float(os.environ.get("SCENE_POSE_ESTIMATE_FEEDBACK_DELAY_S", "1.2")))
+        settle_s = float(os.environ.get("SCENE_POSE_ESTIMATE_FEEDBACK_DELAY_S", "1.2"))
+        started = clock.reference_time()
+        while (clock.reference_time().timestamp_ns - started.timestamp_ns) / 1e9 < settle_s:
+            _check_map_operation()
+            await asyncio.sleep(0.1)
         after = await asyncio.to_thread(_map_rpc, "get_pose", {}, 3.0)
         out.update(requested_pose=payload, mode=mode_info, pose_before=before,
                    pose_after=after, delta_before=_pose_delta(before),
@@ -1929,7 +2068,7 @@ def _gpu_sample():
 
 def _cost_sample(detector):
     """One reading of what the running perception backend costs."""
-    now = time.time()
+    now = clock.time()
     sample = {"at": now}
 
     backend = getattr(detector, "backend_name", None)

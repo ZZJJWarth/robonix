@@ -46,16 +46,15 @@
     const POLL_MS = 200;  // 5 Hz
     const STALE_MS = 2000; // mark stale if no update in 2s
 
-    let lastRgbStamp = 0, lastDepthStamp = 0;
+    let lastRgbCount = null, lastDepthCount = null;
 
-    function fmtAge(stamp_ms) {
-      if (!stamp_ms) return '—';
-      const age = (Date.now() - stamp_ms) / 1000;
-      if (age < 0 || age > 1e6) return 'stamp ' + Math.round(stamp_ms / 1000);
+    function fmtAge(age_ms) {
+      if (age_ms == null) return '—';
+      const age = age_ms / 1000;
       return age.toFixed(1) + 's ago';
     }
 
-    function applyTile(panelId, payload, lastStamp) {
+    function applyTile(panelId, payload, lastCount) {
       const tile = document.getElementById(panelId);
       const img  = document.getElementById(panelId + '_img');
       const empty = document.getElementById(panelId + '_empty');
@@ -64,27 +63,26 @@
         img.style.display = 'none';
         empty.style.display = '';
         meta.textContent = '—';
-        return lastStamp;
+        return lastCount;
       }
       empty.style.display = 'none';
       img.style.display = '';
-      // Only re-render when stamp changes (avoid flicker on identical frames).
-      if (payload.stamp_ms !== lastStamp) {
+      if (payload.count !== lastCount) {
         img.src = 'data:image/png;base64,' + payload.png_b64;
       }
-      const ageStr = fmtAge(payload.stamp_ms);
-      const stale = (Date.now() - payload.stamp_ms) > STALE_MS;
+      const ageStr = fmtAge(payload.age_ms);
+      const stale = payload.stale || payload.age_ms == null || payload.age_ms > STALE_MS;
       meta.textContent = `${payload.width}x${payload.height} ${payload.encoding} · ${ageStr}`;
       meta.classList.toggle('stale', stale);
-      return payload.stamp_ms;
+      return payload.count;
     }
 
     async function tick() {
       try {
         const r = await fetch('/api/camera', { cache: 'no-store' });
         const j = await r.json();
-        lastRgbStamp = applyTile('rgb', j.rgb, lastRgbStamp);
-        lastDepthStamp = applyTile('depth', j.depth, lastDepthStamp);
+        lastRgbCount = applyTile('rgb', j.rgb, lastRgbCount);
+        lastDepthCount = applyTile('depth', j.depth, lastDepthCount);
       } catch (_) { /* swallow — next tick retries */ }
       setTimeout(tick, POLL_MS);
     }

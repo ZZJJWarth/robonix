@@ -10,7 +10,7 @@ import asyncio
 import base64
 import logging
 import os
-import time
+from scene_service import clock
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ async def caption_loop(registry, views, map_binding, llm, *,
             continue
         try:
             await caption_one(registry, views, map_binding, llm, tried,
-                              time.monotonic())
+                              clock.monotonic())
         except Exception:  # noqa: BLE001
             log.warning("[scene-caption] caption pass failed", exc_info=True)
 
@@ -74,7 +74,7 @@ async def caption_one(registry, views, map_binding, llm, tried: dict,
                 continue
             try:
                 registry.set_object_caption(
-                    obj.object_id, caption, source="model", now=time.time())
+                    obj.object_id, caption, source="model", now=clock.time())
             except ValueError:
                 continue
         return obj.object_id

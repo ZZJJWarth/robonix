@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import shutil
-import time
+from scene_service import clock
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -229,6 +229,7 @@ class ObjectViewStore:
             return False
         target = self._dir(map_id, object_id) / f"view_{slot}.jpg"
         try:
+            now = clock.time()
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         except OSError as error:
@@ -238,7 +239,7 @@ class ObjectViewStore:
             "index": slot,
             "bearing": round(float(bearing), 4),
             "quality": round(float(quality), 4),
-            "at": time.time(),
+            "at": now,
             "w": int(u1 - u0),
             "h": int(v1 - v0),
         }

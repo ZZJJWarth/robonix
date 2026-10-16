@@ -31,6 +31,9 @@ class _FakeHub:
     def latest(self, kind):
         return self.channels[kind]
 
+    def age(self, kind, message=None):
+        return 0.0 if kind in self.channels else None
+
 
 def _empty_camera_cache():
     """Return isolated mutable cache state for one focused test."""

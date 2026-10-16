@@ -170,7 +170,7 @@ def _call(app, method, path, body=None):
 
     async def receive():
         if done["body"]:
-            return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
         done["body"] = True
         return {"type": "http.request", "body": raw, "more_body": False}
 
@@ -660,8 +660,9 @@ def test_occupancy_timeout_fails_load_and_blocks_save():
         if app is None:
             return
 
+        grid = SimpleNamespace(info=SimpleNamespace(width=10, height=8))
+
         def frozen_latest(_key):  # grid count/stamp never advance
-            grid = SimpleNamespace(info=SimpleNamespace(width=10, height=8))
             return grid, 5.0, 1
 
         env.hub.latest = frozen_latest
@@ -678,6 +679,72 @@ def test_occupancy_timeout_fails_load_and_blocks_save():
         finally:
             del os.environ["SCENE_MAP_READY_TIMEOUT_S"]
     print("  [PASS] test_occupancy_timeout_fails_load_and_blocks_save")
+
+
+def test_map_load_waits_through_pause_for_a_new_grid(monkeypatch):
+    if _unavailable():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        web_mod, app, env = _make_env(
+            tmp, binding={"map_id": "default", "mode": "", "generation": None,
+                          "source": "default"},
+        )
+        old_grid = SimpleNamespace(info=SimpleNamespace(width=10, height=8))
+        new_grid = SimpleNamespace(info=SimpleNamespace(width=12, height=9))
+        ticks = 0
+        real_sleep = asyncio.sleep
+        monkeypatch.setenv("SCENE_MAP_READY_TIMEOUT_S", "0.5")
+        monkeypatch.setattr(web_mod.clock, "reference_time", lambda: SimpleNamespace(
+            timestamp_ns=0, generation=1,
+        ))
+        monkeypatch.setattr(web_mod.clock, "monotonic", lambda: ticks * 300.0)
+
+        async def pause(_seconds):
+            nonlocal ticks
+            ticks += 1
+            assert ticks <= 3, "load must accept the new grid"
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", pause)
+        env.hub.latest = lambda _key: (
+            (new_grid, 0.0, 1) if ticks >= 3 else (old_grid, 100.0, 10)
+        )
+        with _patched(web_mod, rpc=_rpc_ok):
+            status, body = _call(app, "POST", "/api/maps/load", {"map_id": "labx"})
+        assert status == 200 and body["ok"], body
+        assert ticks == 3
+        assert body["occupancy"]["width"] == 12
+
+
+def test_map_load_aborts_on_reference_reset_before_restoring_objects(monkeypatch):
+    if _unavailable():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        web_mod, app, env = _make_env(
+            tmp, binding={"map_id": "default", "mode": "", "generation": None,
+                          "source": "default"}, objs=[_obj("preload")],
+        )
+        grid = SimpleNamespace(info=SimpleNamespace(width=10, height=8))
+        env.hub.latest = lambda _key: (grid, 0.0, 1)
+        generation = 1
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(web_mod.clock, "reference_time", lambda: SimpleNamespace(
+            timestamp_ns=0, generation=generation,
+        ))
+
+        async def reset(_seconds):
+            nonlocal generation
+            generation = 2
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", reset)
+        with _patched(web_mod, rpc=_rpc_ok, maps=_spatial("labx")):
+            status, body = _call(app, "POST", "/api/maps/load", {"map_id": "labx"})
+            assert status == 502 and "generation changed" in body["detail"], body
+            assert set(env.registry._objects) == {"preload"}
+            assert env.binding["map_id"] == "default"
+            status, body = _call(app, "POST", "/api/maps/save", {"map_id": "labx"})
+            assert status == 409 and "save blocked" in body["detail"], body
 
 
 def test_fresh_save_snapshot_failure_names_workable_recovery():
@@ -802,3 +869,77 @@ if __name__ == "__main__":
     test_failed_load_blocks_save_until_successful_retry()
     test_delete_keeps_sidecar_when_snapshot_delete_fails()
     print("\nAll tests passed!")
+
+
+def test_reset_during_object_restore_cannot_publish_old_objects(monkeypatch):
+    if _unavailable():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        web_mod, app, env = _make_env(
+            tmp, binding={"map_id": "live", "mode": "mapping", "source": "lifecycle"},
+        )
+        env.meta.write(make_meta("labx", "labx__s1", 1))
+        generation = [1]
+        monkeypatch.setattr(web_mod.clock, "reference_time", lambda: SimpleNamespace(
+            timestamp_ns=0, generation=generation[0]))
+
+        def load_all(**_kwargs):
+            generation[0] = 2
+            return [_obj("old-generation")]
+
+        env.store.load_all = load_all
+        with _patched(web_mod, rpc=_rpc_ok):
+            status, body = _call(app, "POST", "/api/maps/load", {"map_id": "labx"})
+        assert status == 502 and not body["ok"], body
+        assert "old-generation" not in env.registry._objects
+        assert env.binding["map_id"] == "live"
+
+
+def test_reset_during_object_save_cannot_commit_binding_or_sidecar(monkeypatch):
+    if _unavailable():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        web_mod, app, env = _make_env(
+            tmp, binding={"map_id": "live", "mode": "mapping", "source": "lifecycle"},
+            objs=[_obj("object")],
+        )
+        generation = [1]
+        monkeypatch.setattr(web_mod.clock, "reference_time", lambda: SimpleNamespace(
+            timestamp_ns=0, generation=generation[0]))
+        persist = env.store.persist
+
+        def reset_after_persist(*args, **kwargs):
+            result = persist(*args, **kwargs)
+            generation[0] = 2
+            return result
+
+        env.store.persist = reset_after_persist
+        with _patched(web_mod, rpc=_rpc_ok, maps=_spatial()):
+            status, body = _call(app, "POST", "/api/maps/save", {"map_id": "labx"})
+        assert status == 502 and not body["ok"], body
+        assert env.meta.read("labx") is None
+        assert env.binding["map_id"] == "live"
+
+
+def test_pose_estimate_does_not_publish_after_reset_during_pose_read(monkeypatch):
+    if _unavailable():
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        web_mod, app, _env = _make_env(
+            tmp, binding={"map_id": "live", "mode": "mapping", "source": "lifecycle"},
+        )
+        generation, calls = [1], []
+        monkeypatch.setattr(web_mod.clock, "reference_time", lambda: SimpleNamespace(
+            timestamp_ns=0, generation=generation[0]))
+
+        def rpc(op, *_args):
+            calls.append(op)
+            if op == "get_pose":
+                generation[0] = 2
+                return {"ok": False, "detail": "reference reset"}
+            return {"ok": True, "mode": "mapping"}
+
+        with _patched(web_mod, rpc=rpc):
+            status, body = _call(app, "POST", "/api/maps/pose_estimate", {"x": 0., "y": 0.})
+        assert status == 502 and not body["ok"], body
+        assert calls == ["get_mode", "get_pose"]

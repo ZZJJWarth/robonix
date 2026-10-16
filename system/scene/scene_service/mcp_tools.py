@@ -6,7 +6,7 @@ import asyncio
 import logging
 import math
 import os
-import time
+from scene_service import clock
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING
 
@@ -96,7 +96,10 @@ _last_save_ids: frozenset = frozenset()
 async def _try_save_observation(visible_objects: list) -> None:
     """Fire-and-forget: capture RGB frame + save observation to memgraph."""
     global _last_save_ts, _last_save_ids
-    t0 = time.time()
+    try:
+        t0 = clock.monotonic()
+    except OSError:
+        return
 
     now = t0
     obj_ids = frozenset(o.object_id for o in visible_objects)
@@ -120,11 +123,12 @@ async def _try_save_observation(visible_objects: list) -> None:
             return
 
         h, w, enc = rgb_msg.height, rgb_msg.width, rgb_msg.encoding
-        frame_age_s = (time.time() - stamp_unix) if stamp_unix > 0 else -1
+        age = _HUB.age("rgb", rgb_msg)
+        frame_age_s = age if age is not None else -1
         log.info("scene_hook: rgb %dx%d %s (seq=%d, age=%.1fs)",
                  w, h, enc, seq, frame_age_s)
 
-        t_encode = time.time()
+        t_encode = clock.monotonic()
         import numpy as np
 
         try:
@@ -145,7 +149,7 @@ async def _try_save_observation(visible_objects: list) -> None:
         jpg_bytes = jpg.tobytes()
         img_b64 = base64.b64encode(jpg_bytes).decode("ascii")
         raw_kb, jpg_kb = len(raw) / 1024, len(jpg_bytes) / 1024
-        encode_ms = (time.time() - t_encode) * 1000
+        encode_ms = (clock.monotonic() - t_encode) * 1000
         log.info("scene_hook: encoded %dx%d → JPEG %.1f KB (raw %.1f KB, ratio %.0f%%, %dms)",
                  w, h, jpg_kb, raw_kb, 100 * jpg_kb / max(raw_kb, 1), round(encode_ms))
 
@@ -179,7 +183,7 @@ async def _try_save_observation(visible_objects: list) -> None:
             "session_id": "scene-auto",
             "plan_id": "scene-auto",
             "log_record": {
-                "ts": time.time_ns(),
+                "ts": clock.time_ns(),
                 "level": "Info",
                 "tag": "scene",
                 "msg": msg,
@@ -189,14 +193,14 @@ async def _try_save_observation(visible_objects: list) -> None:
         }
         body_bytes = len(img_b64)  # approximate — base64 dominates
 
-        t_post = time.time()
+        t_post = clock.monotonic()
         import httpx
 
         log.info("scene_hook: POST → memgraph (%d objects, b64len=%d, body≈%.1f KB)",
                  n_objs, len(img_b64), body_bytes / 1024)
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.post(_MEMGRAPH_HOOK_URL, json=payload)
-        post_ms = (time.time() - t_post) * 1000
+        post_ms = (clock.monotonic() - t_post) * 1000
 
         if r.status_code >= 400:
             log.warning("scene_hook: ← memgraph %d (%dms): %s",
@@ -207,12 +211,11 @@ async def _try_save_observation(visible_objects: list) -> None:
         node_id = result.get("node_id", "?")
         _last_save_ts = now
         _last_save_ids = obj_ids
-        total_ms = (time.time() - t0) * 1000
+        total_ms = (clock.monotonic() - t0) * 1000
         log.info("scene_hook: ← memgraph 200 node=%s (%dms post, %dms total)",
                  node_id, round(post_ms), round(total_ms))
     except Exception:
-        total_ms = (time.time() - t0) * 1000
-        log.warning("scene_hook: ! exception after %dms", round(total_ms), exc_info=True)
+        log.warning("scene_hook: ! exception", exc_info=True)
 
 
 def attach_state(
@@ -434,7 +437,7 @@ async def list_objects(_req: ListObjects_Request) -> ListObjects_Response:
 
     return ListObjects_Response(
         objects=objects,
-        stamp_unix=time.time(),
+        stamp_unix=clock.time(),
         map_id=map_id,
         generation=generation,
         generation_supported=generation_supported,
@@ -590,7 +593,7 @@ async def list_regions(_req: ListRegions_Request) -> ListRegions_Response:
             if annotation.kind == "region"
         ],
         map_id=_ANNO_STORE.map_id,
-        stamp_unix=time.time(),
+        stamp_unix=clock.time(),
     )
 
 
@@ -607,7 +610,7 @@ def _polygon_area(points) -> float:
 @mcp_contract(mcp, contract_id="robonix/system/scene/get_robot_context")
 async def get_robot_context(_req: GetRobotContext_Request) -> GetRobotContext_Response:
     """Return one coherent map-frame spatial snapshot for Pilot."""
-    snapshot_at = time.time()
+    snapshot_at = clock.time()
     objects = await _registry().snapshot()
     robot = _robot(objects)
     map_id = _ANNO_STORE.map_id if _ANNO_STORE is not None else ""
@@ -644,7 +647,7 @@ async def get_robot_context(_req: GetRobotContext_Request) -> GetRobotContext_Re
     nearby.sort(key=lambda entry: (entry[0], entry[1].object_id))
 
     observed_at = float(robot.last_seen or 0.0)
-    stale = observed_at <= 0.0 or snapshot_at - observed_at > 2.0
+    stale = robot.age(snapshot_at) > 2.0
     reason = "current Scene spatial snapshot"
     if stale:
         reason = "Scene robot pose is older than 2 seconds"

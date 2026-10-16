@@ -13,7 +13,7 @@ import copy
 import logging
 import math
 import os
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
@@ -292,7 +292,7 @@ class ImageRelationInferer:
         frame_change_threshold: Optional[float] = None,
         failure_backoff_base_s: Optional[float] = None,
         failure_backoff_max_s: Optional[float] = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = clock.monotonic,
     ) -> None:
         self.llm_client = llm_client
         if max_dim is None:
@@ -312,7 +312,7 @@ class ImageRelationInferer:
         # again until this long after the last answer.
         self.refresh_s = max(0.0, _env_float(
             "SCENE_GRAPH_IMAGE_REFRESH_SEC", 600.0))
-        self._last_success_at = 0.0
+        self._last_success_reference = None
         self._clock = clock
         self._last_success_signature: Optional[_RelationInputSignature] = None
         self._last_success_frame: Optional[FrameFingerprint] = None
@@ -334,6 +334,12 @@ class ImageRelationInferer:
         backoff stay distinct: only a real failed call ages the edges."""
         if not self.llm_client.available:
             return None
+        reference = clock.reference_time()
+        if (self._last_success_reference is not None
+                and self._last_success_reference[1] != reference.generation):
+            self._last_success_signature = None
+            self._last_success_frame = None
+            self._last_success_edges = None
         rgb_bgr, K, T_cam_map = bundle
         img_h, img_w = rgb_bgr.shape[:2]
 
@@ -390,12 +396,13 @@ class ImageRelationInferer:
             self._last_success_frame,
         ) or (
             self._same_objects(signature, self._last_success_signature)
-            and self._clock() - self._last_success_at < self.refresh_s
+            and self._last_success_reference is not None
+            and clock.reference_age(*self._last_success_reference) < self.refresh_s
         )
         if unchanged and self._last_success_edges is not None:
             self._record_skip("unchanged-input")
             edges = copy.deepcopy(self._last_success_edges)
-            now_unix = time.time()
+            now_unix = clock.time()
             for edge in edges:
                 edge.method = "cached"
                 edge.updated_at = now_unix
@@ -425,13 +432,15 @@ class ImageRelationInferer:
             log.warning("[image-rel] VLM call failed: %s: %s", type(e).__name__, e)
             raw = {}
         raw_edges = raw.get("edges") if isinstance(raw, dict) else None
+        if reference.generation != clock.reference_time().generation:
+            raise OSError("Chronos reference generation changed during image relation inference")
         if not isinstance(raw_edges, list):
             self._record_failure(self._clock())
             return ImageRelationResult((), "failed")
         edges = parse_image_relations(raw, box_to_oid)
         self._last_success_signature = signature
         self._last_success_frame = frame
-        self._last_success_at = self._clock()
+        self._last_success_reference = (reference.timestamp_ns, reference.generation)
         self._last_success_edges = copy.deepcopy(edges)
         self._clear_failure()
         self._stats.processed += 1

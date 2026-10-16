@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -106,7 +106,7 @@ def validate_footprint_response(response, *, provider_id: str = "") -> RobotFoot
         inscribed_radius_m=inscribed,
         circumscribed_radius_m=circumscribed,
         provider_id=provider_id,
-        received_at_unix=time.time(),
+        received_at_unix=clock.time(),
     )
 
 

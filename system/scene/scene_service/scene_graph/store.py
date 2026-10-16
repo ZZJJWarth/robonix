@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-import time
+from scene_service import clock
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +42,7 @@ class SceneGraphStore:
             base = base / _sanitize_map_id(map_id)
         self._cache_dir = base
         self._relation_cache: dict[str, SceneGraphEdge] = {}
+        self._reset_count = 0
         self._load_caches()
 
     # ── live graph slices ────────────────────────────────────────────────
@@ -49,13 +50,15 @@ class SceneGraphStore:
     def set_geometric(
         self, nodes: list[SceneGraphNode], edges: list[SceneGraphEdge]
     ) -> None:
+        updated_at = clock.time()
         self._nodes = {n.object_id: n for n in nodes}
         self._geometric_edges = edges
-        self._geometric_updated_at = time.time()
+        self._geometric_updated_at = updated_at
 
     def set_semantic_edges(self, edges: list[SceneGraphEdge]) -> None:
+        updated_at = clock.time()
         self._semantic_edges = edges
-        self._semantic_updated_at = time.time()
+        self._semantic_updated_at = updated_at
 
     def get_semantic_edges(self) -> list[SceneGraphEdge]:
         return self._semantic_edges
@@ -128,6 +131,7 @@ class SceneGraphStore:
 
     def clear_derived_state(self) -> None:
         """Clear both live slices and the cache (flush-scale operations)."""
+        self._reset_count += 1
         self._nodes.clear()
         self._geometric_edges.clear()
         self._semantic_edges.clear()

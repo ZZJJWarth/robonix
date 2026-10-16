@@ -442,9 +442,12 @@ def _live(reg, label, x, now=1000.0):
 
 
 def test_a_pruned_id_forwards_to_the_object_that_absorbed_it():
+    from scene_service import clock
     reg = ObjectRegistry()
     loser, winner = _live(reg, "chair", 1.0), _live(reg, "chair", 1.2)
     reg.soft_evict(loser)
+    reference = clock.reference_time()
+    loser._reference_receipt = (reference.timestamp_ns - 100_000_000_000, reference.generation)
     reg.prune_expired(now=1100.0, ttl_s=30.0, merge_dist_m=1.5)
     assert reg.resolve_id(loser.object_id)[0] == winner.object_id
 

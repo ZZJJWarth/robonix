@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 import os
-import time
+from scene_service import clock
 from typing import Any, Optional
 
 from ..state.object_registry import ObjectRegistry, SceneObject
@@ -79,6 +80,14 @@ def _object_to_node(obj: SceneObject) -> SceneGraphNode:
     )
 
 
+def _observation_key(objects):
+    return {
+        o.object_id: (o.observation_count, o._reference_receipt, o.missing,
+                      _object_to_node(o))
+        for o in objects
+    }
+
+
 class SceneGraphBuilder:
     """Reads the registry, infers semantic edges, publishes them to the store."""
 
@@ -100,6 +109,9 @@ class SceneGraphBuilder:
         self.object_store = object_store
         # A detector with latest_frame_bundle() enables the image relation pass.
         self.perception = perception
+        self._sampling = clock._ReferenceSampling()
+        self._observations = None
+        self._store_reset_count = store._reset_count
         self.image_inferer = (
             ImageRelationInferer(relation_inferer.llm_client)
             if self.cfg.image_relations_enabled
@@ -107,11 +119,37 @@ class SceneGraphBuilder:
         )
 
     async def rebuild_once(self) -> SceneGraphSnapshot:
-        t0 = time.monotonic()
+        t0 = clock.monotonic()
+        reference = clock.reference_time()
+        reset_count = self.store._reset_count
+        if reset_count != self._store_reset_count:
+            self._sampling = clock._ReferenceSampling()
+            self._observations = None
+            if self.image_inferer is not None:
+                self.image_inferer = ImageRelationInferer(self.relation_inferer.llm_client)
+            self._store_reset_count = reset_count
         objs_dict = await self.registry.snapshot()
+        self._check_generation(reference, reset_count)
+        registry_ids = set(objs_dict)
+        previous = self.store.get_semantic_edges()
+        kept = [e for e in previous
+                if e.source_id in registry_ids and e.target_id in registry_ids]
+        if len(kept) != len(previous):
+            self.store.set_semantic_edges(kept)
+            self.store.prune_relations(registry_ids)
+        observations = _observation_key(objs_dict.values())
+        if (observations == self._observations
+                or not self._sampling.admit(reference, self.cfg.interval_sec)):
+            return SceneGraphSnapshot(
+                nodes={o.object_id: _object_to_node(o) for o in objs_dict.values()
+                       if _is_stable(o, self.cfg.min_observations)},
+                edges=list(self.store.get_semantic_edges()), updated_at=clock.time(),
+            )
+        changed = {oid for oid, value in observations.items()
+                   if self._observations is None or self._observations.get(oid) != value}
+        self._observations = observations
         # Includes `missing` objects: an edge dies when an endpoint leaves the
         # registry, not when it flickers for a tick.
-        registry_ids = set(objs_dict.keys())
 
         stable = [
             o for o in objs_dict.values()
@@ -123,18 +161,12 @@ class SceneGraphBuilder:
         # Fewer than two stable objects is usually a perception blip, not an
         # empty scene: keep the last edges instead of wiping the graph.
         if len(stable) < 2:
-            prev = self.store.get_semantic_edges()
-            kept = [
-                e for e in prev
-                if e.source_id in registry_ids and e.target_id in registry_ids
-            ]
-            if len(kept) != len(prev):
-                self.store.set_semantic_edges(kept)
+            kept = self.store.get_semantic_edges()
             log.info(
                 "[scene-graph] rebuild: %d stable node(s) (<2), preserved "
                 "%d semantic edge(s)", len(stable), len(kept),
             )
-            return SceneGraphSnapshot(nodes={}, edges=kept, updated_at=time.time())
+            return SceneGraphSnapshot(nodes={}, edges=kept, updated_at=clock.time())
 
         nodes = [_object_to_node(o) for o in stable]
 
@@ -149,7 +181,7 @@ class SceneGraphBuilder:
                     image_result, registry_ids
                 )
             else:
-                edges, confirmed_pairs = await self._infer_text_edges(nodes)
+                edges, confirmed_pairs = await self._infer_text_edges(nodes, reference, reset_count)
 
         if self.cfg.max_stale_rounds > 0:
             for old in self.store.get_semantic_edges():
@@ -158,18 +190,19 @@ class SceneGraphBuilder:
                 if (old.source_id not in registry_ids
                         or old.target_id not in registry_ids):
                     continue
-                if old.stale_rounds + 1 > self.cfg.max_stale_rounds:
+                rounds = old.stale_rounds + int(old.source_id in changed or old.target_id in changed)
+                if rounds > self.cfg.max_stale_rounds:
                     continue
-                old.stale_rounds += 1
-                edges.append(old)
+                edges.append(replace(old, stale_rounds=rounds))
 
+        self._check_generation(reference, reset_count)
         self.store.set_semantic_edges(edges)
         self.store.prune_relations(registry_ids)
         self.store.flush_caches()
         snapshot = SceneGraphSnapshot(
             nodes={n.object_id: n for n in nodes},
             edges=edges,
-            updated_at=time.time(),
+            updated_at=clock.time(),
         )
 
         if self.object_store is not None:
@@ -181,9 +214,14 @@ class SceneGraphBuilder:
 
         log.info(
             "[scene-graph] rebuild: %d nodes, %d edges, %.1fs",
-            len(nodes), len(edges), time.monotonic() - t0,
+            len(nodes), len(edges), clock.monotonic() - t0,
         )
         return snapshot
+
+    def _check_generation(self, reference, reset_count):
+        if (reference.generation != clock.reference_time().generation
+                or reset_count != self.store._reset_count):
+            raise OSError("Scene graph reset during relation inference")
 
     def _accept_image_result(
         self,
@@ -220,9 +258,11 @@ class SceneGraphBuilder:
             return ImageRelationResult((), "failed")
 
     async def _infer_text_edges(
-        self, nodes: list[SceneGraphNode]
+        self, nodes: list[SceneGraphNode], reference=None, reset_count=None
     ) -> tuple[list[SceneGraphEdge], set[tuple[str, str]]]:
         """Per-pair text inference, used when there is no camera frame."""
+        reference = reference or clock.reference_time()
+        reset_count = self.store._reset_count if reset_count is None else reset_count
         edges: list[SceneGraphEdge] = []
         confirmed_pairs: set[tuple[str, str]] = set()
         geo_rel: dict[frozenset[str], str] = {
@@ -268,6 +308,7 @@ class SceneGraphBuilder:
                     reason=str(e),
                 )
             llm_calls += 1
+            self._check_generation(reference, reset_count)
             self.store.put_cached_relation(
                 a, b, hint, edge, semantic_only=semantic_only
             )

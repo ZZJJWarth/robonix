@@ -53,6 +53,63 @@ The metric pipeline is ConceptGraphs-style per-frame perception with 4 stages:
 
 Periodic cleanup (every 30 ticks) runs concept-graphs's `denoise_objects` + `filter_objects` + `merge_overlap_objects` so duplicates from edge-case detections eventually collapse.
 
+## Time source
+
+Scene reads time through the native `robonix-chronos-clock` binding. Public
+`*_unix` fields and memgraph log timestamps use wall time. Pose freshness,
+object grace periods and deletion TTL, detection photographs, DualMap keyframe
+time intervals and VLM result-cache age use the selected reference time.
+ConceptGraphs and VLM sampling periods count reference seconds; real wake-up
+intervals still limit CPU use. Geometric debounce and semantic stale rounds
+require reference progress and changed observations. Repeated polling of frozen
+evidence keeps their scores and age unchanged. Model requests and failure
+backoff keep real limits. Sampling can still miss frames when inference is busy.
+Map save/load RPC budgets `SCENE_MAP_SAVE_TIMEOUT_S` (default 300) and
+`SCENE_MAP_LOAD_TIMEOUT_S` (default 240), pose reads and pose feedback settling
+use reference time. Mapping keeps real limits for service calls, computation,
+SQLite and preview writing; gRPC keepalive protects the transport. HTTP
+disconnection cancels pending RPCs. A changed reference aborts the request
+before semantic restoration or binding.
+After a map load, `SCENE_MAP_READY_TIMEOUT_S` (default 20) also counts reference
+seconds while waiting for a new occupancy grid. A pause keeps the wait open;
+a reference generation change aborts it before semantic state is restored.
+Grid delivery is checked by message identity, so a reset delivery counter or
+timestamp cannot make a cached grid satisfy the wait.
+Network deadlines, startup computation, performance measurements and VLM failure
+backoff use real steady time. Startup waits for robot inputs use reference time.
+ROS headers and TF queries retain their source
+time domain.
+
+When `system.chronos.core.reference.kind` is `ros_time`, `rbnx boot` passes
+that kind and the Chronos provider id into Scene's `reference` config. Scene
+subscribes to `robonix/system/chronos/reference_time` through Atlas; it retries
+on real time and reconciles channels before reconnecting or stopping. A missing
+reference or a stream silent for five real seconds is unavailable. Scene never
+substitutes wall time for a selected simulation reference. For a standalone
+Scene deployment, provide `reference: {kind: ros_time, provider_id: chronos}`
+in its Driver INIT config. Rebuild `rbnx`, the Python clock wheel, package
+protobuf bindings and Scene images before enabling this path.
+
+Zero reference time is valid. A simulation pause does not age observations.
+ConceptGraphs processes each completed RGB delivery once, so a paused camera
+does not add observations by repeating its last frame.
+A changed generation clears runtime objects, pose, sensor/TF caches and derived
+perception/graph state before exposing the new reference. Camera calibration
+and saved map files remain available. Results from an earlier generation are
+discarded. The camera page uses the backend's reference age and delivery count,
+so it does not compare simulation timestamps with the browser's clock.
+
+Clock read errors are raised without a fallback timestamp. ROS
+ingest skips failed receipts before replacing the message, timestamp or count;
+the stale and pose loops retry at their normal intervals.
+
+`scripts/build.sh` builds the binding with Rust and `uvx maturin`, then installs
+the wheel into both Docker variants or the Jetson native Python environment.
+DualMap inherits the binding from the Scene base image. Build on the deployment
+architecture and rebuild existing images before starting the migrated service.
+For workspace development, `uv sync --package robonix-system-scene` installs
+the declared binding dependency.
+
 ## Deployment targets (x86 / Jetson)
 
 Unlike the Rust system binaries (atlas / executor / pilot / liaison — one
@@ -407,6 +464,13 @@ never mixed. The selected provider must expose both `camera/rgb` and
 the legacy auto-discovery behaviour for single-camera deployments.
 
 Scene supports lifecycle initialization, activation, and clean shutdown.
+Activation returns `Deferred` until runtime resources are ready; managed
+launchers retry it. Input discovery uses the selected reference budget, and
+`SCENE_PERCEPTION_WAIT_S` (default 30) counts reference seconds before RGB-D
+degradation. Activation work outside input waits has a budget of 85 real
+seconds. An input discovery loop that stops making progress for 85 real seconds
+also fails activation. Map lifecycle discovery retains its real grace period
+and latched-sample wait because it probes service startup metadata.
 `CMD_DEACTIVATE` is not yet a pause operation: Scene rejects it as deferred and
 remains `ACTIVE`, because its ROS subscriptions, perception workers, and Web UI
 cannot currently be paused atomically. Use `CMD_SHUTDOWN` to stop Scene. A

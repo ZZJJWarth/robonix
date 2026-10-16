@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Optional
 
@@ -99,8 +99,8 @@ def read_latched_lifecycle(topic: str, timeout_s: float) -> Optional[dict]:
             depth=1,
         )
         node.create_subscription(MapLifecycle, topic, got.append, qos)
-        deadline = time.monotonic() + timeout_s
-        while not got and time.monotonic() < deadline:
+        deadline = clock.monotonic() + timeout_s
+        while not got and clock.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.2)
         if not got:
             return None

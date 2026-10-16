@@ -6,18 +6,24 @@ from __future__ import annotations
 import asyncio
 
 from scene_service.state import BBox3D, ObjectRegistry, Pose3D
+from scene_service import clock
 
 
 def _seed(registry: ObjectRegistry, label: str = "chair"):
     async def go():
         async with registry.lock():
-            return registry.insert_object(
+            obj = registry.insert_object(
                 label=label,
                 pose=Pose3D(1.0, 1.0, 0.1, 0.0, "map"),
                 bbox=BBox3D(0.5, 0.5, 0.9, 0.0, "map"),
                 confidence=0.9,
                 now=100.0,
             )
+            reference = clock.reference_time()
+            obj._reference_receipt = (
+                reference.timestamp_ns - 3_600_000_000_000, reference.generation,
+            )
+            return obj
     return asyncio.run(go())
 
 

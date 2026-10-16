@@ -1831,9 +1831,32 @@ pub async fn execute(
                     output::boot_skip(key, "not on disk");
                     continue;
                 }
-                let (manifest_override, runtime_config) =
+                let (manifest_override, mut runtime_config) =
                     robonix_cli::manifest::split_system_package_config(value)
                         .with_context(|| format!("parse system/{key} package selector"))?;
+                if key == "scene"
+                    && let Some(chronos) = deploy.system.get("chronos")
+                {
+                    let reference = &chronos["core"]["reference"];
+                    if reference["kind"].as_str() == Some("ros_time") {
+                        let inherited = serde_yaml::to_value(serde_json::json!({
+                            "kind": "ros_time",
+                            "provider_id": chronos["provider_id"].as_str().unwrap_or("chronos"),
+                        }))?;
+                        let config = runtime_config
+                            .as_mapping_mut()
+                            .context("Scene config must be a mapping")?;
+                        let reference_key = serde_yaml::Value::String("reference".into());
+                        if let Some(explicit) = config.get(&reference_key) {
+                            anyhow::ensure!(
+                                explicit == &inherited,
+                                "Scene reference must match system.chronos reference"
+                            );
+                        } else {
+                            config.insert(reference_key, inherited);
+                        }
+                    }
+                }
                 let entry = PackageEntry {
                     name: key.clone(),
                     path: Some(pkg_dir.to_string_lossy().into_owned()),

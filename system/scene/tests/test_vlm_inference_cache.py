@@ -176,10 +176,15 @@ def test_block_metric_separates_noise_from_small_local_objects():
         ), f"{size}px local object change must invalidate the cache"
 
 
-def test_detection_cache_age_applies_only_to_newly_delivered_frames():
+def test_detection_cache_age_applies_only_to_newly_delivered_frames(monkeypatch):
     """Fresh deliveries refresh/cache-expire; a frozen delivery never does."""
     holder = {"sample": (_jpeg(_scene_rgb()), 1.0)}
     now = {"value": 0.0}
+    from types import SimpleNamespace
+    from scene_service import clock
+    monkeypatch.setattr(clock, "reference_time", lambda: SimpleNamespace(
+        timestamp_ns=int(now["value"] * 1_000_000_000), generation=1,
+    ))
     published = []
 
     async def capture(detections):
@@ -459,7 +464,7 @@ def test_relation_cache_reuses_input_and_invalidates_scene_changes(caplog):
         assert first
         refreshed_at = first.edges[0].updated_at + 10.0
         with patch(
-            "scene_service.scene_graph.image_relations.time.time",
+            "scene_service.scene_graph.image_relations.clock.time",
             return_value=refreshed_at,
         ):
             second = await inferer.infer(list(reversed(nodes)), bundle)

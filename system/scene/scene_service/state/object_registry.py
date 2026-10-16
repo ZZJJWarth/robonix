@@ -8,7 +8,7 @@ import asyncio
 import math
 import warnings
 import re
-import time
+from scene_service import clock
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -115,6 +115,12 @@ class SceneObject:
     caption_updated_at: float = 0.0
     caption_source: str = ""      # "model" | "operator" | "" (none yet)
     attributes: dict[str, object] = field(default_factory=dict)
+    _reference_receipt: tuple[int, int] | None = field(default=None, repr=False)
+
+    def age(self, now: float | None = None) -> float:
+        if self._reference_receipt is None:
+            return (clock.time() if now is None else now) - self.last_seen
+        return clock.reference_age(*self._reference_receipt)
 
     @property
     def settled(self) -> bool:
@@ -167,7 +173,9 @@ class ObjectRegistry:
     async def snapshot(self) -> dict[str, SceneObject]:
         """Atomic shallow copy."""
         async with self._lock:
-            return dict(self._objects)
+            reference = clock.reference_time()
+            return {oid: obj for oid, obj in self._objects.items()
+                    if obj._reference_receipt is None or obj._reference_receipt[1] == reference.generation}
 
     # Bounded so a long session cannot grow this without limit; oldest first,
     # because a forwarding address matters most while something still holds the
@@ -409,6 +417,7 @@ class ObjectRegistry:
         source: str = "perception",
     ) -> SceneObject:
         """Allocate a new SceneObject. Caller must hold `self._lock`."""
+        reference = clock.reference_time()
         oid = self._alloc_id()
         attrs = dict(DEFAULT_ATTRIBUTES)
         attrs.update(_CLASS_ATTRIBUTE_DEFAULTS.get(label, {}))
@@ -426,6 +435,7 @@ class ObjectRegistry:
             observation_count=1,
             missing=False,
             attributes=attrs,
+            _reference_receipt=(reference.timestamp_ns, reference.generation),
         )
         self._objects[oid] = obj
         return obj
@@ -460,6 +470,7 @@ class ObjectRegistry:
         ema_conf: float = 0.3,
     ) -> None:
         """EMA-blend new observation into the existing record."""
+        reference = clock.reference_time()
         a = ema_pose
         obj.pose = Pose3D(
             x=(1 - a) * obj.pose.x + a * new_pose.x,
@@ -471,6 +482,7 @@ class ObjectRegistry:
         obj.confidence = max(0.0, min(1.0, (1 - ema_conf) * obj.confidence + ema_conf * new_confidence))
         obj.observation_count += 1
         obj.last_seen = now
+        obj._reference_receipt = (reference.timestamp_ns, reference.generation)
         if obj.missing:
             obj.missing = False  # re-acquired
 
@@ -489,7 +501,7 @@ class ObjectRegistry:
             # negative observations.
             if obj.attributes.get("observation_lifecycle") == "visibility":
                 continue
-            if (now - obj.last_seen) > self.grace_period_s:
+            if obj.age(now) > self.grace_period_s:
                 obj.missing = True
                 flipped += 1
         return flipped
@@ -551,7 +563,7 @@ class ObjectRegistry:
             # stale CG cloud reads as clear absence at its old footprint, which
             # must not erase the human's edit.
             and not self._operator_touched(o)
-            and (now - o.last_seen) > ttl_s
+            and o.age(now) > ttl_s
         ]
         for oid in doomed:
             obj = self._objects[oid]
@@ -654,6 +666,10 @@ class ObjectRegistry:
         """Move what `other` knew onto `survivor` and retire its id."""
         survivor.observation_count += max(0, other.observation_count)
         survivor.first_seen = min(survivor.first_seen, other.first_seen)
+        reference = clock.reference_time()
+        receipts = [receipt for receipt in (survivor._reference_receipt, other._reference_receipt)
+                    if receipt is not None and receipt[1] == reference.generation]
+        survivor._reference_receipt = max(receipts, default=None)
         survivor.last_seen = max(survivor.last_seen, other.last_seen)
         # The survivor may only be missing because this record held the
         # recent sightings.
@@ -699,4 +715,4 @@ def _dist3(a: Pose3D, b: Pose3D) -> float:
 
 def now_unix() -> float:
     """Wall-clock unix seconds."""
-    return time.time()
+    return clock.time()

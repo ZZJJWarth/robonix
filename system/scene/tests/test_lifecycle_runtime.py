@@ -44,18 +44,38 @@ def test_legacy_config_file_remains_a_deprecated_fallback(
     }
 
 
-def test_activate_waits_for_real_runtime_readiness() -> None:
+def test_activate_defers_until_runtime_readiness() -> None:
     lifecycle = SceneLifecycleRuntime(logging.getLogger("test"), activate_timeout_s=0.5)
-    result: list[object] = []
-    caller = threading.Thread(target=lambda: result.append(lifecycle.on_activate()))
-
-    caller.start()
-    assert lifecycle.activation_requested.wait(0.2)
-    assert caller.is_alive()
+    assert isinstance(lifecycle.on_activate(), Deferred)
+    assert lifecycle.activation_requested.is_set()
     lifecycle.mark_runtime_ready()
-    caller.join(0.2)
+    assert isinstance(lifecycle.on_activate(), Ok)
 
-    assert isinstance(result[0], Ok)
+
+def test_input_wait_does_not_spend_real_activation_work_budget(monkeypatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr("scene_service.lifecycle_runtime.time.monotonic", lambda: now[0])
+    lifecycle = SceneLifecycleRuntime(logging.getLogger("test"), activate_timeout_s=5.0)
+    assert isinstance(lifecycle.on_activate(), Deferred)
+    with lifecycle.waiting_for_inputs():
+        for _ in range(100):
+            now[0] += 2.0
+            lifecycle.note_input_progress()
+            assert isinstance(lifecycle.on_activate(), Deferred)
+    now[0] += 6.0
+    assert isinstance(lifecycle.on_activate(), Err)
+
+
+def test_stuck_input_discovery_retains_a_real_deadline(monkeypatch) -> None:
+    now = [0.0]
+    monkeypatch.setattr("scene_service.lifecycle_runtime.time.monotonic", lambda: now[0])
+    lifecycle = SceneLifecycleRuntime(logging.getLogger("test"), activate_timeout_s=5.0)
+    assert isinstance(lifecycle.on_activate(), Deferred)
+    with lifecycle.waiting_for_inputs():
+        now[0] += 6.0
+        result = lifecycle.on_activate()
+    assert isinstance(result, Err)
+    assert "stopped responding" in result.message
 
 
 def test_repeated_activate_is_idempotent_after_runtime_is_ready() -> None:

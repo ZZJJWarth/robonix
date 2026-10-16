@@ -317,7 +317,7 @@ def _call(app, method: str, path: str, body=None):
 
     async def receive():
         if done["body"]:
-            return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
         done["body"] = True
         return {"type": "http.request", "body": raw, "more_body": False}
 

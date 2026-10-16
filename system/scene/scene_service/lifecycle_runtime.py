@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +141,10 @@ class SceneLifecycleRuntime:
         self._config: dict = {}
         self._runtime_error = ""
         self._shutdown_error = ""
+        self._activation_started = None
+        self._input_wait_started = None
+        self._input_progress_at = None
+        self._input_wait_elapsed = 0.0
 
     @property
     def config(self) -> dict:
@@ -174,15 +180,42 @@ class SceneLifecycleRuntime:
         return Ok()
 
     def on_activate(self):
-        """Request async startup and wait until Scene is actually ready."""
+        """Keep activation deferred until async startup has finished."""
         self.activation_requested.set()
-        if not self.runtime_ready.wait(self.activate_timeout_s):
-            return Err(
-                f"Scene activation timed out after {self.activate_timeout_s:.1f}s"
-            )
         with self._lock:
+            if self.shutdown_requested.is_set():
+                return Err("Scene shutdown requested during activation")
+            now = time.monotonic()
+            if self._activation_started is None:
+                self._activation_started = now
+            waiting = self._input_wait_elapsed
+            if self._input_wait_started is not None:
+                waiting += now - self._input_wait_started
+                if now - self._input_progress_at >= self.activate_timeout_s:
+                    return Err("Scene input discovery stopped responding")
+            if not self.runtime_ready.is_set():
+                if now - self._activation_started - waiting >= self.activate_timeout_s:
+                    return Err(f"Scene activation work exceeded {self.activate_timeout_s:.1f} real seconds")
+                return Deferred("waiting for Scene runtime readiness")
             error = self._runtime_error
         return Err(error) if error else Ok()
+
+    @contextmanager
+    def waiting_for_inputs(self):
+        """Input discovery spends the launcher's reference budget."""
+        with self._lock:
+            self._input_wait_started = time.monotonic()
+            self._input_progress_at = self._input_wait_started
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._input_wait_elapsed += time.monotonic() - self._input_wait_started
+                self._input_wait_started = None
+
+    def note_input_progress(self):
+        with self._lock:
+            self._input_progress_at = time.monotonic()
 
     def on_shutdown(self):
         """Request async cleanup and wait before Driver(SHUTDOWN) acknowledges."""

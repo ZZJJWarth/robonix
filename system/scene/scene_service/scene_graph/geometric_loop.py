@@ -14,8 +14,9 @@ import math
 import os
 from typing import Iterable, Optional
 
+from .. import clock
 from ..state.object_registry import Pose3D, SceneObject
-from .builder import _is_stable, _object_to_node
+from .builder import _is_stable, _object_to_node, _observation_key
 from .geometry import CONF_MED, strict_geometric_relations
 from .store import SceneGraphStore
 from .types import INVERSE_RELATIONS, SceneGraphEdge
@@ -85,6 +86,9 @@ class GeometricRelationLoop:
         self._enter = 2
         self._max = 3
         self._scores: dict[tuple[str, str, str], tuple[int, SceneGraphEdge]] = {}
+        self._sampling = clock._ReferenceSampling()
+        self._observations = None
+        self._store_reset_count = store._reset_count
         self._task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
 
@@ -121,14 +125,36 @@ class GeometricRelationLoop:
                 pass
 
     async def _tick(self) -> None:
+        reference = clock.reference_time()
+        if self._store_reset_count != self.store._reset_count:
+            self._scores.clear()
+            self._sampling = clock._ReferenceSampling()
+            self._observations = None
+            self._store_reset_count = self.store._reset_count
         objs_dict = await self.registry.snapshot()
+        if (reference.generation != clock.reference_time().generation
+                or self._store_reset_count != self.store._reset_count):
+            return
         objects = list(objs_dict.values())
+        observations = _observation_key(objects)
+        if observations == self._observations:
+            return
         stable = [o for o in objects if _is_stable(o, self.min_observations)]
         nodes = [_object_to_node(o) for o in stable]
+        if not self._sampling.admit(reference, self.period_s):
+            edges = [e for e in self.store.get_geometric_edges()
+                     if e.source_id in objs_dict and e.target_id in objs_dict]
+            self.store.set_geometric(nodes, edges)
+            return
+        changed = {oid for oid, value in observations.items()
+                   if self._observations is None or self._observations.get(oid) != value}
+        self._observations = observations
+        self._scores = {key: value for key, value in self._scores.items()
+                        if key[0] in objs_dict and key[1] in objs_dict}
         raw = self._reachable_edges(objects, stable)
         if _RELATIONS_MODE == "geometric":
             raw.extend(self._object_relations(nodes))
-        self.store.set_geometric(nodes, self._debounce(raw))
+        self.store.set_geometric(nodes, self._debounce(raw, changed))
 
     def _reachable_edges(
         self, objects: list[SceneObject], stable: list[SceneObject]
@@ -180,14 +206,16 @@ class GeometricRelationLoop:
                 ))
         return out
 
-    def _debounce(self, edges: list[SceneGraphEdge]) -> list[SceneGraphEdge]:
+    def _debounce(self, edges: list[SceneGraphEdge], changed=None) -> list[SceneGraphEdge]:
         """Present keys gain a point (capped at _max), absent keys lose one."""
         present = {(e.source_id, e.target_id, e.relation): e for e in edges}
         new_state: dict[tuple[str, str, str], tuple[int, SceneGraphEdge]] = {}
         emitted: list[SceneGraphEdge] = []
         for key in set(self._scores) | set(present):
             prev_score, prev_edge = self._scores.get(key, (0, None))
-            if key in present:
+            if changed is not None and key[0] not in changed and key[1] not in changed:
+                score, edge = prev_score, prev_edge
+            elif key in present:
                 score, edge = min(self._max, prev_score + 1), present[key]
             else:
                 score, edge = prev_score - 1, prev_edge

@@ -7,6 +7,7 @@ exponentially.
 from __future__ import annotations
 
 import asyncio
+from scene_service.clock import _ReferenceSampling
 import base64
 import copy
 import json
@@ -14,7 +15,7 @@ import logging
 import math
 import os
 import re
-import time
+from scene_service import clock
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -83,7 +84,7 @@ class VLMObjectDetector:
         cache_max_age_s: Optional[float] = None,
         failure_backoff_base_s: Optional[float] = None,
         failure_backoff_max_s: Optional[float] = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = clock.monotonic,
     ) -> None:
         # `rgb_fetcher` returns JPEG bytes, optionally with a delivery count so a
         # frozen stream cannot refresh objects.
@@ -112,7 +113,9 @@ class VLMObjectDetector:
         self._last_success_detections: Optional[list[dict]] = None
         self._last_seen_delivery_count: Optional[int | float] = None
         self._last_published_delivery_count: Optional[int | float] = None
-        self._last_success_at = 0.0
+        self._last_success_reference = None
+        self._sampling = _ReferenceSampling()
+        self._reset_count = 0
         self._failure_streak = 0
         self._retry_at = 0.0
         self._stats = InferenceCounters()
@@ -158,11 +161,21 @@ class VLMObjectDetector:
                 pass
             self._task = None
 
+    async def reset_derived_state(self) -> None:
+        self._reset_count += 1
+        self._sampling = clock._ReferenceSampling()
+        self._last_success_frame = None
+        self._last_success_detections = None
+        self._last_success_reference = None
+        self._last_seen_delivery_count = None
+        self._last_published_delivery_count = None
+
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 if self.api_key:
-                    await self._tick()
+                    if self._sampling.admit(clock.reference_time(), self.period_s):
+                        await self._tick()
             except Exception as e:  # noqa: BLE001
                 log.warning("[scene-vlm] tick failed: %s", e)
             try:
@@ -183,6 +196,8 @@ class VLMObjectDetector:
         if not jpeg_bytes:
             return
         now = self._clock()
+        reference = clock.reference_time()
+        reset_count = self._reset_count
         frame = fingerprint_jpeg(jpeg_bytes)
         unchanged = frames_equivalent(
             frame,
@@ -195,7 +210,8 @@ class VLMObjectDetector:
         )
         cache_fresh = (
             self.cache_max_age_s > 0.0
-            and now - self._last_success_at < self.cache_max_age_s
+            and self._last_success_reference is not None
+            and clock.reference_age(*self._last_success_reference) < self.cache_max_age_s
         )
         if unchanged and (same_delivery or cache_fresh):
             self._record_skip("unchanged-frame")
@@ -229,10 +245,14 @@ class VLMObjectDetector:
             self._record_failure(self._clock())
             return
 
+        if (reset_count != self._reset_count
+                or reference.generation != clock.reference_time().generation):
+            return
+
         self._last_success_frame = frame
         self._last_success_detections = copy.deepcopy(detections_json)
         self._last_seen_delivery_count = delivery_count
-        self._last_success_at = self._clock()
+        self._last_success_reference = (reference.timestamp_ns, reference.generation)
         self._clear_failure()
         self._stats.processed += 1
         self._log_stats(logging.INFO, "processed")

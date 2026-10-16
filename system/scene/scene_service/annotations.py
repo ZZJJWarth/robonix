@@ -7,7 +7,7 @@ import logging
 import math
 import os
 import threading
-import time
+from scene_service import clock
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -201,7 +201,7 @@ class AnnotationStore:
         try:
             stored_gen, anns = _parse_file(self._path)
         except (ValueError, TypeError, KeyError, AttributeError) as e:
-            aside = self._path.with_suffix(f".json.corrupt-{int(time.time())}")
+            aside = self._path.with_suffix(f".json.corrupt-{int(clock.time())}")
             # Rename failures re-raise: continuing with an empty store would
             # let the next accepted edit os.replace() the corrupt file —
             # destroying exactly the bytes this path promises to keep. Failing
@@ -262,7 +262,7 @@ class AnnotationStore:
     def create(self, *, kind: str, name: str, points: list,
                theta: Optional[float] = None) -> Annotation:
         """Create + persist an annotation and return it."""
-        now = time.time()
+        now = clock.time()
         norm_points = [[float(x), float(y)] for x, y in points]
         norm_theta = None if theta is None else float(theta)
         with self._lock:
@@ -301,6 +301,7 @@ class AnnotationStore:
             ann = self._annotations.get(annotation_id)
             if ann is None:
                 return None
+            now = clock.time()
             if name is not None:
                 ann.name = name
             if points is not None:
@@ -310,7 +311,7 @@ class AnnotationStore:
                 ann.theta = float(theta)
             if clear_stale:
                 ann.stale, ann.stale_reason = False, ""
-            ann.updated_at = time.time()
+            ann.updated_at = now
             self._save_locked()
             return ann
 
