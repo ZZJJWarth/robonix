@@ -58,6 +58,13 @@ steady time. Simulated reference currently supports direct domains; affine
 device-clock fitting against `ros_time` is rejected during configuration.
 Restart the deployment to change the reference source.
 
+`config.spec` describes the `system.chronos` fields for configuration forms,
+including the reference source and reader command. Chronos is optional globally,
+but must stay enabled in deployments that select its reference time. Console
+must classify Chronos as `builtin` and discover `system/chronos/config.spec` to
+show its switch and form. Console versions that classify it as `stub` need an
+update; use the manifest YAML until then.
+
 The reference stream sends a heartbeat at least once per real second,
 independently of the configured quality publication period. Verify this path
 with separate Atlas, Chronos and Soma processes from a sourced ROS environment:
