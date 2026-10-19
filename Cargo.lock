@@ -3192,12 +3192,25 @@ dependencies = [
 name = "robonix-chronos"
 version = "1.1.0-beta.1"
 dependencies = [
+ "anyhow",
+ "clap",
  "libc",
+ "prost",
+ "protoc-bin-vendored",
+ "robonix-atlas",
  "robonix-chronos-clock",
+ "robonix-codegen",
  "robonix-scribe",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -4260,6 +4273,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
