@@ -53,6 +53,11 @@ Step detection adds both readings' sampling uncertainty to `max_clock_step_ns`,
 so scheduling delays within the measured brackets do not reset clock generations.
 Realtime moving backward still starts a new generation.
 
+The shared `ChronosConfigError` retains the existing configuration error
+variants for compatibility with `robonix-chronos`; domain validation and YAML
+configuration parsing remain in that package. `robonix-chronos` re-exports the
+clock types, so existing consumers can keep their imports.
+
 Run `cargo test -p robonix-chronos-clock` from the repository root on Linux with
 `cc` available for the isolated clock-failure fixture.
 
