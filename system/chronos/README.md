@@ -1,19 +1,7 @@
-# Chronos — unified time
+# Chronos
 
-One of the 12 Robonix system components. Provides a single monotonic
-time source plus PTP / IEEE-1588 alignment between hardware (lidar,
-camera, IMU, chassis odometry) and the runtime.
+`robonix-chronos` provides `ChronosCore`: a deterministic device-to-reference clock model library. Register a clock domain and policy, submit paired `ClockObservation` values, then query status, model coefficients or conversions. It does not read host clocks or run a process.
 
-**Status — v0.1 stub.** Not yet implemented.
+The core bounds its observation window, checks integer conversion overflow, tracks reference/device generations, and handles wrap, outliers, holdover and reset. Model updates support step and bounded slew.
 
-For now, components read system wall time / per-sensor timestamps
-directly. Scene / mapping fuse multimodal data on their own. Chronos
-will absorb that responsibility in v0.2.
-
-When implemented, Chronos will:
-
-- expose a single `time/now` capability returning a monotonic, machine-
-  global time stamp consistent with sensor headers,
-- run a PTP master/slave loop (1588v2) to discipline NIC clocks across
-  the body's compute units,
-- emit drift / sync-quality metrics to [vitals](../vitals/).
+Run `cargo test -p robonix-chronos --test core`.
