@@ -199,6 +199,82 @@ fn converts_with_versioned_checked_model() {
 }
 
 #[test]
+fn accepts_and_fits_rate_change_within_drift_policy() {
+    for (initial_rate, rate) in [
+        (0, -400_000),
+        (0, 400_000),
+        (400_000, -400_000),
+        (-400_000, 400_000),
+    ] {
+        let mut core = ChronosCore::new();
+        core.register(descriptor(None), policy()).unwrap();
+        for sequence in 1..=16 {
+            let device = sequence as i64 * 500_000_000;
+            let correction = (device.min(2_000_000_000) * initial_rate
+                + (device - 2_000_000_000).max(0) * rate)
+                / 1_000_000_000;
+            let status = core
+                .observe(
+                    "camera_clock",
+                    observation(
+                        sequence,
+                        device,
+                        10_000_000_000 + device + correction,
+                        device as u64,
+                    ),
+                )
+                .unwrap();
+            if sequence >= 3 {
+                assert_eq!(status.state, DomainState::Tracking);
+            }
+        }
+        assert_eq!(core.model("camera_clock").unwrap().rate_adjust_ppb(), rate);
+    }
+}
+
+#[test]
+fn outlier_gate_includes_rounded_elapsed_drift_allowance() {
+    // The 500,000,001 ns gap permits 250,001 ns of drift at 500 ppm.
+    let limit_ns = 2_000 + 101 + 250_001 + 100;
+    for residual_ns in [limit_ns, limit_ns + 1] {
+        let mut core = tracking_core(0);
+        let result = core.observe(
+            "camera_clock",
+            observation(5, 5_000_000_000, 15_000_000_000 + residual_ns, 500_000_005),
+        );
+        if residual_ns == limit_ns {
+            assert_eq!(result.unwrap().state, DomainState::Tracking);
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                ChronosError::ObservationOutlier {
+                    residual_ns: residual_ns as u64,
+                    limit_ns: limit_ns as u64,
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn holdover_observation_within_grown_uncertainty_restores_tracking() {
+    let mut core = tracking_core(0);
+    core.refresh(2_000_000_004).unwrap();
+    let status = core.status("camera_clock", 2_000_000_004).unwrap();
+    assert_eq!(status.state, DomainState::Holdover);
+    assert!(status.uncertainty_ns.unwrap() > 3_000);
+    let recovered = core
+        .observe(
+            "camera_clock",
+            observation(5, 6_000_000_001, 16_000_003_001, 2_000_000_005),
+        )
+        .unwrap();
+    assert_eq!(recovered.state, DomainState::Tracking);
+    assert_eq!(recovered.accepted_observations, 5);
+    assert_eq!(recovered.rejected_observations, 0);
+}
+
+#[test]
 /// A mature model rejects a large residual without replacing its model version.
 fn rejects_obvious_outlier_without_replacing_model() {
     let mut core = tracking_core(0);

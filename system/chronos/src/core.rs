@@ -248,7 +248,7 @@ impl ChronosCore {
             record.rejected_observations = record.rejected_observations.saturating_add(1);
             record.last_seen_sequence_id = Some(observation.sequence_id);
             record.last_seen_steady_ns = Some(observation.steady_received_ns);
-            let limit_ns = outlier_limit(&candidate, observation.uncertainty_ns);
+            let limit_ns = outlier_limit(&candidate, &observation)?;
             return Err(ChronosError::ObservationOutlier {
                 residual_ns,
                 limit_ns,
@@ -492,16 +492,43 @@ fn is_outlier(
     };
     let predicted = model.extrapolate_normalized(normalized_device_ns)?;
     let residual = absolute_difference(predicted, observation.reference_timestamp_ns)?;
-    Ok(residual > outlier_limit(record, observation.uncertainty_ns))
+    Ok(residual > outlier_limit(record, observation)?)
 }
 
-/// Combine the configured residual bound with both measurement uncertainties.
-fn outlier_limit(record: &DomainRecord, observation_uncertainty_ns: u64) -> u64 {
-    record
+fn outlier_limit(
+    record: &DomainRecord,
+    observation: &ClockObservation,
+) -> Result<u64, ChronosError> {
+    let elapsed_ns = record
+        .last_observation_steady_ns
+        .map_or(0, |last| observation.steady_received_ns - last);
+    // Policy bounds absolute drift; residuals are relative to the fitted rate.
+    let rate_bound_ppb = u128::from(record.policy.max_drift_ppm) * 1_000
+        + record
+            .model
+            .as_ref()
+            .map_or(0, |model| u128::from(model.rate_adjust_ppb.unsigned_abs()));
+    // A windowed fit may still lag the latest accepted sample during a rate change.
+    let latest_residual = match (record.model.as_ref(), record.samples.back()) {
+        (Some(model), Some(sample)) => absolute_difference(
+            model.extrapolate_normalized(sample.device_timestamp_ns)?,
+            sample.reference_timestamp_ns,
+        )?,
+        _ => 0,
+    };
+    Ok(record
         .policy
         .max_residual_ns
-        .saturating_add(record.fitted_uncertainty_ns)
-        .saturating_add(observation_uncertainty_ns)
+        .saturating_add(record.fitted_uncertainty_ns.max(latest_residual))
+        .saturating_add(drift_allowance_ns(elapsed_ns, rate_bound_ppb))
+        .saturating_add(observation.uncertainty_ns))
+}
+
+fn drift_allowance_ns(elapsed_ns: u64, rate_bound_ppb: u128) -> u64 {
+    let growth = u128::from(elapsed_ns)
+        .saturating_mul(rate_bound_ppb)
+        .div_ceil(1_000_000_000);
+    u64::try_from(growth).unwrap_or(u64::MAX)
 }
 
 /// Store one accepted sample and its ordering boundary before fitting.
@@ -812,9 +839,10 @@ fn refresh_record(record: &mut DomainRecord, now_steady_ns: u64) -> Result<(), C
         return Ok(());
     }
     let holdover_age = age - record.policy.tracking_timeout_ns;
-    let drift_product = u128::from(holdover_age) * u128::from(record.policy.max_drift_ppm);
-    let drift_growth = drift_product / 1_000_000 + u128::from(drift_product % 1_000_000 != 0);
-    let drift_growth = u64::try_from(drift_growth).unwrap_or(u64::MAX);
+    let drift_growth = drift_allowance_ns(
+        holdover_age,
+        u128::from(record.policy.max_drift_ppm) * 1_000,
+    );
     let uncertainty = record.fitted_uncertainty_ns.saturating_add(drift_growth);
     let next_state = match record.state {
         DomainState::Fault => DomainState::Fault,
