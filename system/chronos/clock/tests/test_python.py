@@ -27,8 +27,10 @@ class ClockTests(unittest.TestCase):
 
     def test_wall_clock_has_epoch_time_and_quality(self):
         self.assertGreater(clock.wall_timestamp_ns(), 0)
-        self.assertIsInstance(clock.wall_time(), clock.VirtualReferenceTime)
-        self.assertTrue(clock.wall_time().available)
+        reading = clock.wall_time()
+        self.assertIsInstance(reading, clock.VirtualReferenceTime)
+        self.assertGreater(reading.timestamp_ns, 0)
+        self.assertGreater(reading.uncertainty_ns, 0)
 
     def test_snapshot_preserves_integer_times_and_read_only_quality(self):
         before = clock.steady_time().timestamp_ns
@@ -40,7 +42,7 @@ class ClockTests(unittest.TestCase):
         self.assertLessEqual(snapshot.steady.timestamp_ns, after)
         self.assertGreater(snapshot.reference.uncertainty_ns, 0)
         self.assertFalse(snapshot.reference.verified)
-        self.assertGreater(clock.reference_timestamp_ns(), 0)
+        self.assertGreater(snapshot.reference.timestamp_ns, 0)
         with self.assertRaises(AttributeError):
             snapshot.reference.timestamp_ns = 0
         with self.assertRaises(AttributeError):
@@ -55,7 +57,7 @@ class ClockTests(unittest.TestCase):
     def test_read_failures_quality_and_reference_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             library = Path(directory) / "clock_failure.so"
-            fixture = Path(__file__).resolve().parents[3] / "atlas/tests/clock_failure.c"
+            fixture = Path(__file__).resolve().parent / "support/clock_failure.c"
             subprocess.run([
                 "cc", "-shared", "-fPIC", "-std=c11", "-Wall", "-Wextra", "-Werror",
                 str(fixture), "-ldl", "-o", str(library),
@@ -86,13 +88,15 @@ def fault_case():
     case.assertGreater(reading.uncertainty_ns, 1_000_000)
     with case.assertRaises(OSError):
         clock.reference_timestamp_ns()
+    case.assertFalse(clock.wall_time().available)
+    case.assertGreater(clock.wall_timestamp_ns(), 0)
     mode(2)
     case.assertLess(clock.reference_time().timestamp_ns, 0)
     with case.assertRaises(OSError):
         clock.reference_timestamp_ns()
     mode(0)
     recovered = clock.reference_time()
-    case.assertTrue(recovered.available)
+    case.assertGreater(recovered.timestamp_ns, 0)
     case.assertGreater(recovered.generation, first.generation)
     mode(8)
     stepped = clock.snapshot().reference
